@@ -28,7 +28,7 @@ To check that the user is inside the groups *dialout* and *tty*.
 
 Then you can test the pre-compiled Appimage (Ubuntu 24.04) version by allowing the execution and then double click. 
 
-Or you can decide to buil it from Rust source (it will takes a minute) using:
+Or you can decide to build it from Rust source (it will takes a minute) using:
 
 ```
 cargo run
