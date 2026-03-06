@@ -40,3 +40,5 @@ To generate the gcode file (required) the author has successfully used [LaserWeb
 
 Stay Tuned!
 
+## This project has been completely Vibe Coded with Codex! 
+
