@@ -36,7 +36,7 @@ cargo run
 
 This project *does not* generate the gcode itself, it just sends it to the laser engraver.
 
-To generate the gcode file (required) the author has successfully used [LaserWeb 4]{https://laserweb.yurl.ch/}, which suppports Ubuntu 24.04 (Appimage).
+To generate the gcode file (required) the author has successfully used [LaserWeb 4](https://laserweb.yurl.ch/), which suppports Ubuntu 24.04 (Appimage).
 
 Stay Tuned!
 
