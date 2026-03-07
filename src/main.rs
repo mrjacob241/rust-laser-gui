@@ -1,8 +1,8 @@
 mod modules;
 
 use eframe::egui;
-use modules::serial_bridge::SerialBridge;
 use modules::serial_lib::{DEFAULT_BAUD, DEFAULT_PORT};
+use modules::serial_worker::{SerialCommand, SerialEvent, SerialWorker};
 use rfd::FileDialog;
 use std::fs;
 
@@ -11,14 +11,14 @@ const JOG_STEP_LUT: [f32; 4] = [0.01, 0.1, 1.0, 10.0];
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("RustLaser CNC")
+            .with_title("RustLaser GUI v0.0")
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([1024.0, 700.0]),
         ..Default::default()
     };
 
     eframe::run_native(
-        "RustLaser CNC",
+        "RustLaser GUI",
         options,
         Box::new(|cc| Ok(Box::new(RustLaserApp::new(cc)))),
     )
@@ -31,7 +31,8 @@ struct RustLaserApp {
     status: String,
     serial_address: String,
     serial_baud: u32,
-    serial_bridge: SerialBridge,
+    serial_worker: SerialWorker,
+    serial_connected: bool,
     serial_input: String,
     serial_log: Vec<String>,
     jog_step_index: i32,
@@ -53,7 +54,8 @@ impl RustLaserApp {
             status: String::new(),
             serial_address: DEFAULT_PORT.to_string(),
             serial_baud: DEFAULT_BAUD,
-            serial_bridge: SerialBridge::new(),
+            serial_worker: SerialWorker::spawn(),
+            serial_connected: false,
             serial_input: String::new(),
             serial_log: vec!["Serial backend not connected yet.".to_string()],
             jog_step_index: 2,
@@ -97,86 +99,45 @@ impl RustLaserApp {
 
     fn jog_move(&mut self, dx: f32, dy: f32) {
         let step = self.jog_step_value();
-        let move_x = dx * step;
-        let move_y = dy * step;
-        let mut command = String::from("G1");
-
-        if move_x.abs() > f32::EPSILON {
-            command.push_str(&format!(" X{move_x:.3}"));
-        }
-        if move_y.abs() > f32::EPSILON {
-            command.push_str(&format!(" Y{move_y:.3}"));
-        }
-
-        if command == "G1" {
-            return;
-        }
-        command.push_str(&format!(" F{:.0}", self.jog_feed.max(1.0)));
-
-        let result = self
-            .serial_bridge
-            .send_line("G91")
-            .and_then(|_| self.serial_bridge.send_line(&command))
-            .and_then(|_| self.serial_bridge.send_line("G90"));
-
-        match result {
-            Ok(()) => self.serial_log.push(format!("TX> G91 | {command} | G90")),
-            Err(err) => self.serial_log.push(format!("Jog failed: {err}")),
+        let cmd = SerialCommand::JogMove {
+            dx,
+            dy,
+            step,
+            feed: self.jog_feed,
+        };
+        if let Err(err) = self.serial_worker.send(cmd) {
+            self.serial_log.push(format!("Jog failed: {err}"));
         }
     }
 
     fn jog_stop(&mut self) {
-        match self.serial_bridge.send_line("M0") {
-            Ok(()) => self.serial_log.push("TX> M0".to_string()),
-            Err(err) => self.serial_log.push(format!("Stop failed: {err}")),
+        if let Err(err) = self.serial_worker.send(SerialCommand::JogStop) {
+            self.serial_log.push(format!("Stop failed: {err}"));
         }
     }
 
     fn send_loaded_gcode(&mut self) {
-        if self.gcode_lines.is_empty() {
-            self.serial_log.push("No G-code loaded.".to_string());
-            return;
+        if let Err(err) = self
+            .serial_worker
+            .send(SerialCommand::SendLoadedGcode(self.gcode_lines.clone()))
+        {
+            self.serial_log.push(format!("Send failed: {err}"));
         }
-
-        let mut sent = 0_u64;
-        for line in &self.gcode_lines {
-            match self.serial_bridge.send_line(line) {
-                Ok(()) => {
-                    sent += 1;
-                }
-                Err(err) => {
-                    self.serial_log.push(format!("Send failed: {err}"));
-                    return;
-                }
-            }
-        }
-
-        self.serial_log
-            .push(format!("Sent {sent} G-code line(s) to serial."));
     }
 
     fn reset_to_origin(&mut self) {
-        let result = self
-            .serial_bridge
-            .send_line("G90")
-            .and_then(|_| self.serial_bridge.send_line("G0 X0 Y0"));
-        match result {
-            Ok(()) => self.serial_log.push("TX> G90 | G0 X0 Y0".to_string()),
-            Err(err) => self.serial_log.push(format!("Reset failed: {err}")),
+        if let Err(err) = self.serial_worker.send(SerialCommand::ResetToOrigin) {
+            self.serial_log.push(format!("Reset failed: {err}"));
         }
     }
 }
 
 impl eframe::App for RustLaserApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.serial_bridge.is_connected() {
-            match self.serial_bridge.poll_reply(2) {
-                Ok(Some(reply)) => self.serial_log.push(format!("RX> {reply}")),
-                Ok(None) => {}
-                Err(err) => {
-                    self.serial_log.push(format!("Serial error: {err}"));
-                    self.serial_bridge.disconnect();
-                }
+        while let Some(event) = self.serial_worker.try_recv() {
+            match event {
+                SerialEvent::Log(line) => self.serial_log.push(line),
+                SerialEvent::Connected(state) => self.serial_connected = state,
             }
         }
 
@@ -227,8 +188,11 @@ impl eframe::App for RustLaserApp {
                             if ui.button("Send").clicked() {
                                 let msg = self.serial_input.trim();
                                 if !msg.is_empty() {
-                                    match self.serial_bridge.send_line(msg) {
-                                        Ok(()) => self.serial_log.push(format!("TX> {msg}")),
+                                    match self
+                                        .serial_worker
+                                        .send(SerialCommand::SendLine(msg.to_string()))
+                                    {
+                                        Ok(()) => {}
                                         Err(err) => {
                                             self.serial_log.push(format!("Send failed: {err}"))
                                         }
@@ -245,19 +209,16 @@ impl eframe::App for RustLaserApp {
                     columns[1].text_edit_singleline(&mut self.serial_address);
                     columns[1].label(format!("Baud: {}", self.serial_baud));
                     if columns[1].button("Connect").clicked() {
-                        if self.serial_bridge.is_connected() {
-                            self.serial_bridge.disconnect();
-                            self.serial_log.push("Disconnected.".to_string());
+                        if self.serial_connected {
+                            if let Err(err) = self.serial_worker.send(SerialCommand::Disconnect) {
+                                self.serial_log.push(format!("Disconnect failed: {err}"));
+                            }
                         } else {
-                            match self
-                                .serial_bridge
-                                .connect(&self.serial_address, self.serial_baud)
-                            {
-                                Ok(()) => self.serial_log.push(format!(
-                                    "Connected to {} @ {} baud.",
-                                    self.serial_address, self.serial_baud
-                                )),
-                                Err(err) => self.serial_log.push(format!("Connect failed: {err}")),
+                            if let Err(err) = self.serial_worker.send(SerialCommand::Connect {
+                                address: self.serial_address.clone(),
+                                baud: self.serial_baud,
+                            }) {
+                                self.serial_log.push(format!("Connect failed: {err}"));
                             }
                         }
                     }
@@ -269,7 +230,7 @@ impl eframe::App for RustLaserApp {
                             self.reset_to_origin();
                         }
                     });
-                    columns[1].label(if self.serial_bridge.is_connected() {
+                    columns[1].label(if self.serial_connected {
                         "Status: Connected"
                     } else {
                         "Status: Disconnected"
@@ -390,19 +351,13 @@ impl eframe::App for RustLaserApp {
                                             .clicked();
                                         if clicked {
                                             if button_id == 1 {
-                                                let home_cmd =
-                                                    format!("G1 X0 Y0 F{:.0}", self.jog_feed.max(1.0));
-                                                let result = self
-                                                    .serial_bridge
-                                                    .send_line("G90")
-                                                    .and_then(|_| self.serial_bridge.send_line(&home_cmd));
-                                                match result {
-                                                    Ok(()) => self
-                                                        .serial_log
-                                                        .push(format!("TX> G90 | {home_cmd}")),
-                                                    Err(err) => self
-                                                        .serial_log
-                                                        .push(format!("Home failed: {err}")),
+                                                if let Err(err) =
+                                                    self.serial_worker.send(SerialCommand::Home {
+                                                        feed: self.jog_feed,
+                                                    })
+                                                {
+                                                    self.serial_log
+                                                        .push(format!("Home failed: {err}"));
                                                 }
                                             } else {
                                                 self.serial_log.push(format!(
@@ -476,7 +431,6 @@ impl eframe::App for RustLaserApp {
                                 }
                             });
                     });
-
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
