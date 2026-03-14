@@ -1,4 +1,5 @@
-# Rust Laser GUI 🚧 WARNING!!! Vibe Coded project! 🚧
+# Rust Laser GUI 
+# 🚧 WARNING!!! Vibe Coded project! 🚧
 
 This simple vibe coded project only exists because no other viable alternatives exist for Linux users. This project is completely open source and the author takes NO RESPONSIBILITY of malfunctionings or misuses of the code in this open source repository. Use it at your Own Risk!
 
