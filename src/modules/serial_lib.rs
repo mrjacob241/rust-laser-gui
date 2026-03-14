@@ -32,6 +32,10 @@ impl SerialClient {
         self.send_raw(&payload)
     }
 
+    pub fn send_status_query(&mut self) -> Result<(), String> {
+        self.send_raw(b"?")
+    }
+
     pub fn read_for(&mut self, duration: Duration) -> io::Result<String> {
         let deadline = Instant::now() + duration;
         let mut buffer = [0_u8; 256];

@@ -2,16 +2,19 @@ mod modules;
 
 use eframe::egui;
 use modules::serial_lib::{DEFAULT_BAUD, DEFAULT_PORT};
-use modules::serial_worker::{SerialCommand, SerialEvent, SerialWorker};
+use modules::serial_worker::{
+    GcodeSerialCountMode, SerialCommand, SerialEvent, SerialWorker, SessionConfig,
+};
 use rfd::FileDialog;
 use std::fs;
+use std::time::Duration;
 
 const JOG_STEP_LUT: [f32; 4] = [0.01, 0.1, 1.0, 10.0];
 
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("RustLaser GUI v0.0")
+            .with_title("RustLaser GUI v0.1")
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([1024.0, 700.0]),
         ..Default::default()
@@ -39,6 +42,13 @@ struct RustLaserApp {
     jog_feed: f32,
     canvas_center: [f32; 2],
     canvas_zoom: f32,
+    show_millimeter_grid: bool,
+    show_workspace_grid: bool,
+    show_workspace_axes: bool,
+    session_config: SessionConfig,
+    gcode_progress_sent: usize,
+    gcode_progress_total: usize,
+    laser_position: Option<[f32; 2]>,
 }
 
 impl RustLaserApp {
@@ -62,6 +72,15 @@ impl RustLaserApp {
             jog_feed: 600.0,
             canvas_center: [75.0, 75.0],
             canvas_zoom: 1.0,
+            show_millimeter_grid: true,
+            show_workspace_grid: true,
+            show_workspace_axes: true,
+            session_config: SessionConfig {
+                gcode_serial_count_mode: GcodeSerialCountMode::RxLogs,
+            },
+            gcode_progress_sent: 0,
+            gcode_progress_total: 0,
+            laser_position: None,
         }
     }
 
@@ -117,9 +136,19 @@ impl RustLaserApp {
     }
 
     fn send_loaded_gcode(&mut self) {
+        self.serial_log.push(format!(
+            "[Printing G-Code] gcode serial count:{}",
+            self.session_config.gcode_serial_count_mode.label()
+        ));
+        self.gcode_progress_sent = 0;
+        self.gcode_progress_total = self.gcode_lines.len();
+        self.laser_position = None;
         if let Err(err) = self
             .serial_worker
-            .send(SerialCommand::SendLoadedGcode(self.gcode_lines.clone()))
+            .send(SerialCommand::SendLoadedGcode {
+                lines: self.gcode_lines.clone(),
+                session_config: self.session_config,
+            })
         {
             self.serial_log.push(format!("Send failed: {err}"));
         }
@@ -130,6 +159,15 @@ impl RustLaserApp {
             self.serial_log.push(format!("Reset failed: {err}"));
         }
     }
+
+    fn reset_workspace_view(&mut self) {
+        self.canvas_center = [75.0, 75.0];
+        self.canvas_zoom = 1.0;
+    }
+
+    fn is_printing(&self) -> bool {
+        self.gcode_progress_total > 0 && self.gcode_progress_sent < self.gcode_progress_total
+    }
 }
 
 impl eframe::App for RustLaserApp {
@@ -138,10 +176,50 @@ impl eframe::App for RustLaserApp {
             match event {
                 SerialEvent::Log(line) => self.serial_log.push(line),
                 SerialEvent::Connected(state) => self.serial_connected = state,
+                SerialEvent::GcodeProgress { sent, total } => {
+                    self.gcode_progress_sent = sent;
+                    self.gcode_progress_total = total;
+                }
+                SerialEvent::LaserPosition { position } => {
+                    self.laser_position = Some(position);
+                }
             }
         }
 
-        egui::TopBottomPanel::top("top_bar").show(ctx, |_ui| {});
+        if self.is_printing() {
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
+
+        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("Settings", |ui| {
+                    ui.checkbox(&mut self.show_millimeter_grid, "Millimeter grid");
+                    ui.checkbox(&mut self.show_workspace_grid, "Show workspace grid");
+                    ui.checkbox(&mut self.show_workspace_axes, "Show workspace axes");
+                    ui.menu_button("gcode serial count", |ui| {
+                        ui.selectable_value(
+                            &mut self.session_config.gcode_serial_count_mode,
+                            GcodeSerialCountMode::CharCount,
+                            "char count",
+                        );
+                        ui.selectable_value(
+                            &mut self.session_config.gcode_serial_count_mode,
+                            GcodeSerialCountMode::RxLogs,
+                            "RX logs",
+                        );
+                    });
+                    ui.label(format!(
+                        "gcode serial count: {}",
+                        self.session_config.gcode_serial_count_mode.label()
+                    ));
+                    ui.separator();
+                    if ui.button("Reset workspace view").clicked() {
+                        self.reset_workspace_view();
+                        ui.close_menu();
+                    }
+                });
+            });
+        });
 
         egui::TopBottomPanel::bottom("console_panel")
             .resizable(true)
@@ -236,7 +314,26 @@ impl eframe::App for RustLaserApp {
                         "Status: Disconnected"
                     });
 
-                    columns[2].heading(" ");
+                    columns[2].heading("Progress");
+                    columns[2].separator();
+                    columns[2].label("G-code lines sent");
+                    let progress = if self.gcode_progress_total > 0 {
+                        self.gcode_progress_sent as f32 / self.gcode_progress_total as f32
+                    } else {
+                        0.0
+                    };
+                    columns[2].scope(|ui| {
+                        ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::from_gray(56);
+                        let progress_percent = progress * 100.0;
+                        ui.add(
+                            egui::ProgressBar::new(progress)
+                                .desired_width(ui.available_width())
+                                .text(format!(
+                                    "{} / {} ({progress_percent:.0}%)",
+                                    self.gcode_progress_sent, self.gcode_progress_total
+                                )),
+                        );
+                    });
                 });
             });
 
@@ -371,6 +468,7 @@ impl eframe::App for RustLaserApp {
                             }
                         });
                 });
+
             });
 
         egui::SidePanel::right("gcode_panel")
@@ -490,33 +588,99 @@ impl eframe::App for RustLaserApp {
 
             let clipped = painter.with_clip_rect(plot);
 
-            let grid_stroke = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(40));
-            for i in 0..=10 {
-                let x = i as f32 * (x_max / 10.0);
-                let y = i as f32 * (y_max / 10.0);
-                let x_top = world_to_screen([x, 0.0], plot, self.canvas_center, scale);
-                let x_bottom = world_to_screen([x, y_max], plot, self.canvas_center, scale);
-                let y_left = world_to_screen([0.0, y], plot, self.canvas_center, scale);
-                let y_right = world_to_screen([x_max, y], plot, self.canvas_center, scale);
-                clipped.line_segment([x_top, x_bottom], grid_stroke);
-                clipped.line_segment([y_left, y_right], grid_stroke);
+            if self.show_millimeter_grid {
+                let zoom_boost = (self.canvas_zoom - 1.0).max(0.0);
+                let fine_grid_alpha = (2.0 + zoom_boost * 2.5)
+                    .round()
+                    .clamp(2.0, 18.0) as u8;
+                let fine_grid_stroke =
+                    egui::Stroke::new(1.0, egui::Color32::from_white_alpha(fine_grid_alpha));
+                for step in 0..=(x_max as i32) {
+                    let x = step as f32;
+                    let x_top = world_to_screen([x, 0.0], plot, self.canvas_center, scale);
+                    let x_bottom = world_to_screen([x, y_max], plot, self.canvas_center, scale);
+                    clipped.line_segment([x_top, x_bottom], fine_grid_stroke);
+                }
+                for step in 0..=(y_max as i32) {
+                    let y = step as f32;
+                    let y_left = world_to_screen([0.0, y], plot, self.canvas_center, scale);
+                    let y_right = world_to_screen([x_max, y], plot, self.canvas_center, scale);
+                    clipped.line_segment([y_left, y_right], fine_grid_stroke);
+                }
             }
 
-            let axis_stroke = egui::Stroke::new(1.5, egui::Color32::from_gray(220));
-            clipped.line_segment(
-                [
-                    world_to_screen([0.0, 0.0], plot, self.canvas_center, scale),
-                    world_to_screen([x_max, 0.0], plot, self.canvas_center, scale),
-                ],
-                axis_stroke,
-            );
-            clipped.line_segment(
-                [
-                    world_to_screen([0.0, 0.0], plot, self.canvas_center, scale),
-                    world_to_screen([0.0, y_max], plot, self.canvas_center, scale),
-                ],
-                axis_stroke,
-            );
+            if self.show_workspace_grid {
+                let grid_stroke = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(40));
+                for i in 0..=10 {
+                    let x = i as f32 * (x_max / 10.0);
+                    let y = i as f32 * (y_max / 10.0);
+                    let x_top = world_to_screen([x, 0.0], plot, self.canvas_center, scale);
+                    let x_bottom = world_to_screen([x, y_max], plot, self.canvas_center, scale);
+                    let y_left = world_to_screen([0.0, y], plot, self.canvas_center, scale);
+                    let y_right = world_to_screen([x_max, y], plot, self.canvas_center, scale);
+                    clipped.line_segment([x_top, x_bottom], grid_stroke);
+                    clipped.line_segment([y_left, y_right], grid_stroke);
+                }
+            }
+
+            if self.show_workspace_axes {
+                let axis_stroke = egui::Stroke::new(1.5, egui::Color32::from_gray(220));
+                clipped.line_segment(
+                    [
+                        world_to_screen([0.0, 0.0], plot, self.canvas_center, scale),
+                        world_to_screen([x_max, 0.0], plot, self.canvas_center, scale),
+                    ],
+                    axis_stroke,
+                );
+                clipped.line_segment(
+                    [
+                        world_to_screen([0.0, 0.0], plot, self.canvas_center, scale),
+                        world_to_screen([0.0, y_max], plot, self.canvas_center, scale),
+                    ],
+                    axis_stroke,
+                );
+
+                let tick_font = egui::TextStyle::Small.resolve(ui.style());
+                let tick_color = egui::Color32::from_gray(210);
+                let tick_stroke = egui::Stroke::new(1.0, tick_color);
+
+                for i in 0..=10 {
+                    let x = i as f32 * (x_max / 10.0);
+                    let y = i as f32 * (y_max / 10.0);
+
+                    let x_tick = world_to_screen([x, 0.0], plot, self.canvas_center, scale);
+                    clipped.line_segment(
+                        [
+                            egui::pos2(x_tick.x, x_tick.y - 4.0),
+                            egui::pos2(x_tick.x, x_tick.y + 4.0),
+                        ],
+                        tick_stroke,
+                    );
+                    painter.text(
+                        egui::pos2(x_tick.x, plot.bottom() + 6.0),
+                        egui::Align2::CENTER_TOP,
+                        format!("{x:.0}"),
+                        tick_font.clone(),
+                        tick_color,
+                    );
+
+                    let y_tick = world_to_screen([0.0, y], plot, self.canvas_center, scale);
+                    clipped.line_segment(
+                        [
+                            egui::pos2(y_tick.x - 4.0, y_tick.y),
+                            egui::pos2(y_tick.x + 4.0, y_tick.y),
+                        ],
+                        tick_stroke,
+                    );
+                    painter.text(
+                        egui::pos2(plot.left() - 6.0, y_tick.y),
+                        egui::Align2::RIGHT_CENTER,
+                        format!("{y:.0}"),
+                        tick_font.clone(),
+                        tick_color,
+                    );
+                }
+            }
 
             if self.gcode_polyline.len() >= 2 {
                 let path_stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(55, 145, 255));
@@ -528,6 +692,26 @@ impl eframe::App for RustLaserApp {
             } else if let Some(point) = self.gcode_polyline.first() {
                 let p = world_to_screen(*point, plot, self.canvas_center, scale);
                 clipped.circle_filled(p, 2.5, egui::Color32::from_rgb(55, 145, 255));
+            }
+
+            let show_laser_marker = self.session_config.gcode_serial_count_mode
+                == GcodeSerialCountMode::RxLogs
+                && self.is_printing();
+            if show_laser_marker {
+                if let Some(position) = self.laser_position {
+                    let p = world_to_screen(position, plot, self.canvas_center, scale);
+                    let marker_color = egui::Color32::from_rgb(255, 120, 80);
+                    let marker_radius = 7.0;
+                    clipped.circle_stroke(p, marker_radius, egui::Stroke::new(2.0, marker_color));
+                    clipped.line_segment(
+                        [egui::pos2(p.x - 5.0, p.y), egui::pos2(p.x + 5.0, p.y)],
+                        egui::Stroke::new(2.0, marker_color),
+                    );
+                    clipped.line_segment(
+                        [egui::pos2(p.x, p.y - 5.0), egui::pos2(p.x, p.y + 5.0)],
+                        egui::Stroke::new(2.0, marker_color),
+                    );
+                }
             }
 
             painter.text(

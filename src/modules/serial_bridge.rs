@@ -32,6 +32,14 @@ impl SerialBridge {
         client.send_line(line)
     }
 
+    pub fn send_status_query(&mut self) -> Result<(), String> {
+        let client = self
+            .client
+            .as_mut()
+            .ok_or("Serial not connected".to_string())?;
+        client.send_status_query()
+    }
+
     pub fn poll_reply(&mut self, wait_ms: u64) -> Result<Option<String>, String> {
         let client = match self.client.as_mut() {
             Some(client) => client,
