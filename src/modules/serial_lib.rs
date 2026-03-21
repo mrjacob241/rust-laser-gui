@@ -36,6 +36,22 @@ impl SerialClient {
         self.send_raw(b"?")
     }
 
+    pub fn send_feed_hold(&mut self) -> Result<(), String> {
+        self.send_raw(b"!")
+    }
+
+    pub fn send_spindle_stop(&mut self) -> Result<(), String> {
+        self.send_raw(&[0x9E])
+    }
+
+    pub fn send_soft_reset(&mut self) -> Result<(), String> {
+        self.send_raw(&[0x18])
+    }
+
+    pub fn send_cycle_start(&mut self) -> Result<(), String> {
+        self.send_raw(b"~")
+    }
+
     pub fn read_for(&mut self, duration: Duration) -> io::Result<String> {
         let deadline = Instant::now() + duration;
         let mut buffer = [0_u8; 256];

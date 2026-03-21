@@ -1,6 +1,8 @@
 use super::serial_bridge::SerialBridge;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -41,6 +43,8 @@ pub enum SerialCommand {
         lines: Vec<String>,
         session_config: SessionConfig,
     },
+    FlushController,
+    ContinueProgram,
     ResetToOrigin,
     JogMove {
         dx: f32,
@@ -57,10 +61,13 @@ pub enum SerialCommand {
 pub enum SerialEvent {
     Log(String),
     Connected(bool),
+    PrintStarted,
+    PrintFinished,
     GcodeProgress {
         sent: usize,
         total: usize,
     },
+    PrintAborted,
     LaserPosition {
         position: [f32; 2],
     },
@@ -69,25 +76,36 @@ pub enum SerialEvent {
 pub struct SerialWorker {
     tx: Sender<SerialCommand>,
     rx: Receiver<SerialEvent>,
+    stop_requested: Arc<AtomicBool>,
 }
 
 impl SerialWorker {
     pub fn spawn() -> Self {
         let (tx_cmd, rx_cmd) = mpsc::channel::<SerialCommand>();
         let (tx_evt, rx_evt) = mpsc::channel::<SerialEvent>();
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let worker_stop_requested = Arc::clone(&stop_requested);
 
-        thread::spawn(move || worker_loop(rx_cmd, tx_evt));
+        thread::spawn(move || worker_loop(rx_cmd, tx_evt, worker_stop_requested));
 
         Self {
             tx: tx_cmd,
             rx: rx_evt,
+            stop_requested,
         }
     }
 
     pub fn send(&self, cmd: SerialCommand) -> Result<(), String> {
+        if matches!(cmd, SerialCommand::SendLoadedGcode { .. }) {
+            self.stop_requested.store(false, Ordering::SeqCst);
+        }
         self.tx
             .send(cmd)
             .map_err(|_| "Serial worker is not available".to_string())
+    }
+
+    pub fn request_stop(&self) {
+        self.stop_requested.store(true, Ordering::SeqCst);
     }
 
     pub fn try_recv(&self) -> Option<SerialEvent> {
@@ -95,23 +113,67 @@ impl SerialWorker {
     }
 }
 
-fn worker_loop(rx_cmd: Receiver<SerialCommand>, tx_evt: Sender<SerialEvent>) {
+fn worker_loop(
+    rx_cmd: Receiver<SerialCommand>,
+    tx_evt: Sender<SerialEvent>,
+    stop_requested: Arc<AtomicBool>,
+) {
     let mut bridge = SerialBridge::new();
+    let mut track_position_until_idle = false;
+    let mut last_resume_status_query = Instant::now() - Duration::from_millis(STATUS_QUERY_MS);
 
     loop {
         match rx_cmd.recv_timeout(Duration::from_millis(20)) {
-            Ok(cmd) => handle_command(cmd, &mut bridge, &tx_evt),
+            Ok(cmd) => handle_command(
+                cmd,
+                &mut bridge,
+                &tx_evt,
+                &stop_requested,
+                &mut track_position_until_idle,
+            ),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
 
+        if bridge.is_connected()
+            && track_position_until_idle
+            && Instant::now().duration_since(last_resume_status_query)
+                >= Duration::from_millis(STATUS_QUERY_MS)
+        {
+            match bridge.send_status_query() {
+                Ok(()) => {
+                    last_resume_status_query = Instant::now();
+                }
+                Err(err) => {
+                    let _ = tx_evt.send(SerialEvent::Log(format!("Status query failed: {err}")));
+                    track_position_until_idle = false;
+                }
+            }
+        }
+
         if bridge.is_connected() {
-            match bridge.poll_reply(2) {
-                Ok(Some(reply)) => emit_lines(&tx_evt, &reply),
+            let poll_wait_ms = if track_position_until_idle {
+                STREAM_POLL_MS
+            } else {
+                2
+            };
+            match bridge.poll_reply(poll_wait_ms) {
+                Ok(Some(reply)) => {
+                    if track_position_until_idle {
+                        handle_resume_tracking_reply(
+                            &tx_evt,
+                            &reply,
+                            &mut track_position_until_idle,
+                        );
+                    } else {
+                        emit_lines(&tx_evt, &reply);
+                    }
+                }
                 Ok(None) => {}
                 Err(err) => {
                     let _ = tx_evt.send(SerialEvent::Log(format!("Serial error: {err}")));
                     bridge.disconnect();
+                    track_position_until_idle = false;
                     let _ = tx_evt.send(SerialEvent::Connected(false));
                 }
             }
@@ -119,9 +181,16 @@ fn worker_loop(rx_cmd: Receiver<SerialCommand>, tx_evt: Sender<SerialEvent>) {
     }
 }
 
-fn handle_command(cmd: SerialCommand, bridge: &mut SerialBridge, tx_evt: &Sender<SerialEvent>) {
+fn handle_command(
+    cmd: SerialCommand,
+    bridge: &mut SerialBridge,
+    tx_evt: &Sender<SerialEvent>,
+    stop_requested: &Arc<AtomicBool>,
+    track_position_until_idle: &mut bool,
+) {
     match cmd {
         SerialCommand::Connect { address, baud } => {
+            *track_position_until_idle = false;
             if bridge.is_connected() {
                 bridge.disconnect();
                 let _ = tx_evt.send(SerialEvent::Connected(false));
@@ -140,6 +209,7 @@ fn handle_command(cmd: SerialCommand, bridge: &mut SerialBridge, tx_evt: &Sender
             }
         }
         SerialCommand::Disconnect => {
+            *track_position_until_idle = false;
             bridge.disconnect();
             let _ = tx_evt.send(SerialEvent::Log("Disconnected.".to_string()));
             let _ = tx_evt.send(SerialEvent::Connected(false));
@@ -157,12 +227,38 @@ fn handle_command(cmd: SerialCommand, bridge: &mut SerialBridge, tx_evt: &Sender
             session_config,
         } => match session_config.gcode_serial_count_mode {
             GcodeSerialCountMode::CharCount => {
-                send_loaded_gcode_worker(bridge, tx_evt, &lines);
+                send_loaded_gcode_worker(bridge, tx_evt, &lines, stop_requested);
             }
             GcodeSerialCountMode::RxLogs => {
-                send_loaded_gcode_worker_rx(bridge, tx_evt, &lines);
+                send_loaded_gcode_worker_rx(bridge, tx_evt, &lines, stop_requested);
+            }
+        },
+        SerialCommand::FlushController => {
+            let result = bridge.send_soft_reset();
+            match result {
+                Ok(()) => {
+                    stop_requested.store(false, Ordering::SeqCst);
+                    *track_position_until_idle = false;
+                    let _ = tx_evt.send(SerialEvent::Log(
+                        "TX> Ctrl-X (soft reset / flush controller state)".to_string(),
+                    ));
+                }
+                Err(err) => {
+                    let _ = tx_evt.send(SerialEvent::Log(format!("Flush failed: {err}")));
+                }
             }
         }
+        SerialCommand::ContinueProgram => match bridge.send_cycle_start() {
+            Ok(()) => {
+                stop_requested.store(false, Ordering::SeqCst);
+                *track_position_until_idle = true;
+                let _ = tx_evt.send(SerialEvent::Log("TX> ~ (cycle start)".to_string()));
+                let _ = tx_evt.send(SerialEvent::PrintStarted);
+            }
+            Err(err) => {
+                let _ = tx_evt.send(SerialEvent::Log(format!("Continue failed: {err}")));
+            }
+        },
         SerialCommand::ResetToOrigin => {
             let result = bridge
                 .send_line("G90")
@@ -203,9 +299,19 @@ fn handle_command(cmd: SerialCommand, bridge: &mut SerialBridge, tx_evt: &Sender
                 }
             }
         }
-        SerialCommand::JogStop => match bridge.send_line("M0") {
+        SerialCommand::JogStop => match bridge.send_feed_hold() {
             Ok(()) => {
-                let _ = tx_evt.send(SerialEvent::Log("TX> M0".to_string()));
+                stop_requested.store(false, Ordering::SeqCst);
+                let _ = tx_evt.send(SerialEvent::Log("TX> ! (feed hold)".to_string()));
+                if let Err(err) = bridge.send_spindle_stop() {
+                    let _ = tx_evt.send(SerialEvent::Log(format!(
+                        "Laser-off request failed after stop: {err}"
+                    )));
+                } else {
+                    let _ = tx_evt.send(SerialEvent::Log(
+                        "TX> spindle/laser stop override".to_string(),
+                    ));
+                }
             }
             Err(err) => {
                 let _ = tx_evt.send(SerialEvent::Log(format!("Stop failed: {err}")));
@@ -228,10 +334,44 @@ fn handle_command(cmd: SerialCommand, bridge: &mut SerialBridge, tx_evt: &Sender
     }
 }
 
+fn handle_resume_tracking_reply(
+    tx_evt: &Sender<SerialEvent>,
+    raw: &str,
+    track_position_until_idle: &mut bool,
+) {
+    for raw_line in raw.lines() {
+        let text = raw_line.trim();
+        if text.is_empty() {
+            continue;
+        }
+
+        let lower = text.to_ascii_lowercase();
+        if lower == "ok" || lower.starts_with("error:") {
+            continue;
+        }
+
+        if text.starts_with('<') {
+            if let Some(report) = parse_grbl_status_report(text) {
+                if let Some(position) = report.position {
+                    let _ = tx_evt.send(SerialEvent::LaserPosition { position });
+                }
+                if report.machine_state == Some(GrblMachineState::Idle) {
+                    *track_position_until_idle = false;
+                    let _ = tx_evt.send(SerialEvent::PrintFinished);
+                }
+            }
+            continue;
+        }
+
+        let _ = tx_evt.send(SerialEvent::Log(format!("RX> {text}")));
+    }
+}
+
 fn send_loaded_gcode_worker(
     bridge: &mut SerialBridge,
     tx_evt: &Sender<SerialEvent>,
     lines: &[String],
+    stop_requested: &Arc<AtomicBool>,
 ) {
     if lines.is_empty() {
         let _ = tx_evt.send(SerialEvent::GcodeProgress { sent: 0, total: 0 });
@@ -240,6 +380,7 @@ fn send_loaded_gcode_worker(
     }
 
     let total = lines.len();
+    let _ = tx_evt.send(SerialEvent::PrintStarted);
     let _ = tx_evt.send(SerialEvent::GcodeProgress { sent: 0, total });
 
     let mut sent = 0_u64;
@@ -251,8 +392,17 @@ fn send_loaded_gcode_worker(
     let mut last_status_emit = Instant::now() - Duration::from_millis(STATUS_GUI_UPDATE_MS);
 
     loop {
+        if stop_requested.load(Ordering::SeqCst) {
+            stop_stream(bridge, tx_evt, stop_requested);
+            return;
+        }
+
         // Character-counting: keep RX near full without overflow.
         while next_index < lines.len() {
+            if stop_requested.load(Ordering::SeqCst) {
+                stop_stream(bridge, tx_evt, stop_requested);
+                return;
+            }
             let line = lines[next_index].clone();
             let bytes = line.len() + 1; // include newline
             if bytes > GRBL_RX_LIMIT {
@@ -355,6 +505,7 @@ fn send_loaded_gcode_worker(
     let _ = tx_evt.send(SerialEvent::Log(format!(
         "Stream completed: sent {sent}, acked {acked}, rx_used {rx_used}/{GRBL_RX_LIMIT}."
     )));
+    let _ = tx_evt.send(SerialEvent::PrintFinished);
     let _ = tx_evt.send(SerialEvent::Log(
         "[Printing G-Code] completed successfully".to_string(),
     ));
@@ -364,6 +515,7 @@ fn send_loaded_gcode_worker_rx(
     bridge: &mut SerialBridge,
     tx_evt: &Sender<SerialEvent>,
     lines: &[String],
+    stop_requested: &Arc<AtomicBool>,
 ) {
     if lines.is_empty() {
         let _ = tx_evt.send(SerialEvent::GcodeProgress { sent: 0, total: 0 });
@@ -372,6 +524,7 @@ fn send_loaded_gcode_worker_rx(
     }
 
     let total = lines.len();
+    let _ = tx_evt.send(SerialEvent::PrintStarted);
     let _ = tx_evt.send(SerialEvent::GcodeProgress { sent: 0, total });
 
     let mut sent = 0_u64;
@@ -382,6 +535,8 @@ fn send_loaded_gcode_worker_rx(
     let mut last_progress = Instant::now();
     let mut rx_free_hint: Option<usize> = None;
     let mut reported_fallback = false;
+    let mut waiting_for_idle_after_send = false;
+    let mut saw_idle_after_send = false;
     let (status_tick_tx, status_tick_rx) = mpsc::channel::<()>();
     let (status_stop_tx, status_stop_rx) = mpsc::channel::<()>();
     let status_thread = thread::spawn(move || {
@@ -398,6 +553,13 @@ fn send_loaded_gcode_worker_rx(
     });
 
     loop {
+        if stop_requested.load(Ordering::SeqCst) {
+            let _ = status_stop_tx.send(());
+            let _ = status_thread.join();
+            stop_stream(bridge, tx_evt, stop_requested);
+            return;
+        }
+
         while status_tick_rx.try_recv().is_ok() {
             if let Err(err) = bridge.send_status_query() {
                 let _ = status_stop_tx.send(());
@@ -408,6 +570,12 @@ fn send_loaded_gcode_worker_rx(
         }
 
         while next_index < lines.len() {
+            if stop_requested.load(Ordering::SeqCst) {
+                let _ = status_stop_tx.send(());
+                let _ = status_thread.join();
+                stop_stream(bridge, tx_evt, stop_requested);
+                return;
+            }
             let line = lines[next_index].clone();
             let bytes = line.len() + 1;
             if bytes > GRBL_RX_LIMIT {
@@ -465,7 +633,10 @@ fn send_loaded_gcode_worker_rx(
         }
 
         if next_index >= lines.len() && in_flight.is_empty() {
-            break;
+            waiting_for_idle_after_send = true;
+            if saw_idle_after_send {
+                break;
+            }
         }
 
         if Instant::now().duration_since(last_progress)
@@ -518,6 +689,12 @@ fn send_loaded_gcode_worker_rx(
 
                     if text.starts_with('<') {
                         if let Some(report) = parse_grbl_status_report(text) {
+                            last_progress = Instant::now();
+                            if waiting_for_idle_after_send
+                                && report.machine_state == Some(GrblMachineState::Idle)
+                            {
+                                saw_idle_after_send = true;
+                            }
                             if let Some(rx_free) = report.rx_free {
                                 let rx_free = rx_free.min(GRBL_RX_LIMIT);
                                 rx_free_hint = Some(rx_free);
@@ -554,23 +731,68 @@ fn send_loaded_gcode_worker_rx(
         "Stream completed ({mode}): sent {sent}, acked {acked}, rx_used {rx_used}/{GRBL_RX_LIMIT}, rx_free_hint {:?}.",
         rx_free_hint
     )));
+    let _ = tx_evt.send(SerialEvent::PrintFinished);
     let _ = tx_evt.send(SerialEvent::Log(
         "[Printing G-Code] completed successfully".to_string(),
     ));
 }
 
+fn stop_stream(
+    bridge: &mut SerialBridge,
+    tx_evt: &Sender<SerialEvent>,
+    stop_requested: &Arc<AtomicBool>,
+) {
+    match bridge.send_feed_hold() {
+        Ok(()) => {
+            let _ = tx_evt.send(SerialEvent::Log("TX> ! (feed hold)".to_string()));
+        }
+        Err(err) => {
+            let _ = tx_evt.send(SerialEvent::Log(format!("Stop failed: {err}")));
+        }
+    }
+    match bridge.send_spindle_stop() {
+        Ok(()) => {
+            let _ = tx_evt.send(SerialEvent::Log(
+                "TX> spindle/laser stop override".to_string(),
+            ));
+        }
+        Err(err) => {
+            let _ = tx_evt.send(SerialEvent::Log(format!(
+                "Laser-off request failed after stop: {err}"
+            )));
+        }
+    }
+    let _ = tx_evt.send(SerialEvent::PrintAborted);
+    let _ = tx_evt.send(SerialEvent::Log(
+        "[Printing G-Code] aborted by stop request".to_string(),
+    ));
+    stop_requested.store(false, Ordering::SeqCst);
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct GrblStatusReport {
+    machine_state: Option<GrblMachineState>,
     planner_free: Option<usize>,
     rx_free: Option<usize>,
     position: Option<[f32; 2]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrblMachineState {
+    Idle,
+    Other,
 }
 
 fn parse_grbl_status_report(line: &str) -> Option<GrblStatusReport> {
     let body = line.strip_prefix('<')?.strip_suffix('>')?;
     let mut report = GrblStatusReport::default();
 
-    for field in body.split('|') {
+    for (idx, field) in body.split('|').enumerate() {
+        if idx == 0 {
+            report.machine_state = Some(parse_machine_state(field));
+            continue;
+        }
+
         if let Some(rest) = field.strip_prefix("Bf:") {
             let mut parts = rest.split(',');
             report.planner_free = parts.next().and_then(parse_status_usize);
@@ -601,6 +823,15 @@ fn parse_grbl_status_report(line: &str) -> Option<GrblStatusReport> {
     }
 
     Some(report)
+}
+
+fn parse_machine_state(value: &str) -> GrblMachineState {
+    let state = value.split(':').next().unwrap_or("").trim();
+    if state.eq_ignore_ascii_case("idle") {
+        GrblMachineState::Idle
+    } else {
+        GrblMachineState::Other
+    }
 }
 
 fn parse_status_usize(value: &str) -> Option<usize> {

@@ -40,6 +40,38 @@ impl SerialBridge {
         client.send_status_query()
     }
 
+    pub fn send_feed_hold(&mut self) -> Result<(), String> {
+        let client = self
+            .client
+            .as_mut()
+            .ok_or("Serial not connected".to_string())?;
+        client.send_feed_hold()
+    }
+
+    pub fn send_spindle_stop(&mut self) -> Result<(), String> {
+        let client = self
+            .client
+            .as_mut()
+            .ok_or("Serial not connected".to_string())?;
+        client.send_spindle_stop()
+    }
+
+    pub fn send_soft_reset(&mut self) -> Result<(), String> {
+        let client = self
+            .client
+            .as_mut()
+            .ok_or("Serial not connected".to_string())?;
+        client.send_soft_reset()
+    }
+
+    pub fn send_cycle_start(&mut self) -> Result<(), String> {
+        let client = self
+            .client
+            .as_mut()
+            .ok_or("Serial not connected".to_string())?;
+        client.send_cycle_start()
+    }
+
     pub fn poll_reply(&mut self, wait_ms: u64) -> Result<Option<String>, String> {
         let client = match self.client.as_mut() {
             Some(client) => client,

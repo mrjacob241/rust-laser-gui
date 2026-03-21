@@ -10,11 +10,12 @@ use std::fs;
 use std::time::Duration;
 
 const JOG_STEP_LUT: [f32; 4] = [0.01, 0.1, 1.0, 10.0];
+const LEFT_PANEL_BUTTON_LABEL_WIDTH: usize = "Button 0".len();
 
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("RustLaser GUI v0.1")
+            .with_title("RustLaser GUI v0.2")
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([1024.0, 700.0]),
         ..Default::default()
@@ -46,9 +47,11 @@ struct RustLaserApp {
     show_workspace_grid: bool,
     show_workspace_axes: bool,
     session_config: SessionConfig,
+    print_active: bool,
     gcode_progress_sent: usize,
     gcode_progress_total: usize,
     laser_position: Option<[f32; 2]>,
+    controller_reset_required: bool,
 }
 
 impl RustLaserApp {
@@ -78,9 +81,11 @@ impl RustLaserApp {
             session_config: SessionConfig {
                 gcode_serial_count_mode: GcodeSerialCountMode::RxLogs,
             },
+            print_active: false,
             gcode_progress_sent: 0,
             gcode_progress_total: 0,
             laser_position: None,
+            controller_reset_required: false,
         }
     }
 
@@ -130,12 +135,17 @@ impl RustLaserApp {
     }
 
     fn jog_stop(&mut self) {
-        if let Err(err) = self.serial_worker.send(SerialCommand::JogStop) {
+        self.controller_reset_required = true;
+        if self.is_printing() {
+            self.serial_worker.request_stop();
+        } else if let Err(err) = self.serial_worker.send(SerialCommand::JogStop) {
             self.serial_log.push(format!("Stop failed: {err}"));
         }
     }
 
     fn send_loaded_gcode(&mut self) {
+        self.controller_reset_required = false;
+        self.print_active = true;
         self.serial_log.push(format!(
             "[Printing G-Code] gcode serial count:{}",
             self.session_config.gcode_serial_count_mode.label()
@@ -165,8 +175,37 @@ impl RustLaserApp {
         self.canvas_zoom = 1.0;
     }
 
+    fn handle_print_aborted(&mut self) {
+        self.print_active = false;
+        self.gcode_progress_sent = 0;
+        self.gcode_progress_total = 0;
+        self.laser_position = None;
+        self.status =
+            "Job stopped. Controller is likely in feed-hold; flush/reset to start a new session."
+                .to_string();
+    }
+
+    fn flush_controller(&mut self) {
+        if let Err(err) = self.serial_worker.send(SerialCommand::FlushController) {
+            self.serial_log.push(format!("Flush failed: {err}"));
+        } else {
+            self.status = "Controller session reset. Ready for new commands or G-code.".to_string();
+            self.controller_reset_required = false;
+        }
+    }
+
+    fn continue_program(&mut self) {
+        if let Err(err) = self.serial_worker.send(SerialCommand::ContinueProgram) {
+            self.serial_log.push(format!("Continue failed: {err}"));
+        } else {
+            self.print_active = true;
+            self.status = "Continue sent. Controller resumed from hold.".to_string();
+            self.controller_reset_required = false;
+        }
+    }
+
     fn is_printing(&self) -> bool {
-        self.gcode_progress_total > 0 && self.gcode_progress_sent < self.gcode_progress_total
+        self.print_active
     }
 }
 
@@ -176,10 +215,13 @@ impl eframe::App for RustLaserApp {
             match event {
                 SerialEvent::Log(line) => self.serial_log.push(line),
                 SerialEvent::Connected(state) => self.serial_connected = state,
+                SerialEvent::PrintStarted => self.print_active = true,
+                SerialEvent::PrintFinished => self.print_active = false,
                 SerialEvent::GcodeProgress { sent, total } => {
                     self.gcode_progress_sent = sent;
                     self.gcode_progress_total = total;
                 }
+                SerialEvent::PrintAborted => self.handle_print_aborted(),
                 SerialEvent::LaserPosition { position } => {
                     self.laser_position = Some(position);
                 }
@@ -308,6 +350,19 @@ impl eframe::App for RustLaserApp {
                             self.reset_to_origin();
                         }
                     });
+                    if self.controller_reset_required {
+                        columns[1].add_space(6.0);
+                        columns[1].scope(|ui| {
+                            ui.visuals_mut().widgets.inactive.bg_fill =
+                                egui::Color32::from_rgb(110, 45, 35);
+                            ui.visuals_mut().widgets.hovered.bg_fill =
+                                egui::Color32::from_rgb(135, 55, 42);
+                            if ui.button("Flush / Reset").clicked() {
+                                self.flush_controller();
+                            }
+                        });
+                        columns[1].label("Controller is held after Stop. Reset to continue.");
+                    }
                     columns[1].label(if self.serial_connected {
                         "Status: Connected"
                     } else {
@@ -380,7 +435,13 @@ impl eframe::App for RustLaserApp {
                         .show(ui, |ui| {
                             ui.add_sized(button_size, egui::Label::new(""));
                             ui.add_sized(button_size, egui::Label::new(""));
-                            if ui.add_sized(button_size, egui::Button::new("Up")).clicked() {
+                            if ui
+                                .add_sized(
+                                    button_size,
+                                    egui::Button::new(pad_left_panel_button_label("Up")),
+                                )
+                                .clicked()
+                            {
                                 self.jog_move(0.0, 1.0);
                             }
                             ui.add_sized(button_size, egui::Label::new(""));
@@ -388,19 +449,37 @@ impl eframe::App for RustLaserApp {
 
                             ui.add_sized(button_size, egui::Label::new(""));
                             if ui
-                                .add_sized(button_size, egui::Button::new("Left"))
+                                .add_sized(
+                                    button_size,
+                                    egui::Button::new(pad_left_panel_button_label("Left")),
+                                )
                                 .clicked()
                             {
                                 self.jog_move(-1.0, 0.0);
                             }
                             if ui
-                                .add_sized(button_size, egui::Button::new("Stop"))
+                                .add_sized(
+                                    button_size,
+                                    if self.is_printing() {
+                                        egui::Button::new(
+                                            egui::RichText::new(pad_left_panel_button_label("Stop"))
+                                                .strong()
+                                                .color(egui::Color32::WHITE),
+                                        )
+                                        .fill(egui::Color32::from_rgb(180, 40, 40))
+                                    } else {
+                                        egui::Button::new(pad_left_panel_button_label("Stop"))
+                                    },
+                                )
                                 .clicked()
                             {
                                 self.jog_stop();
                             }
                             if ui
-                                .add_sized(button_size, egui::Button::new("Right"))
+                                .add_sized(
+                                    button_size,
+                                    egui::Button::new(pad_left_panel_button_label("Right")),
+                                )
                                 .clicked()
                             {
                                 self.jog_move(1.0, 0.0);
@@ -410,7 +489,10 @@ impl eframe::App for RustLaserApp {
                             ui.add_sized(button_size, egui::Label::new(""));
                             ui.add_sized(button_size, egui::Label::new(""));
                             if ui
-                                .add_sized(button_size, egui::Button::new("Down"))
+                                .add_sized(
+                                    button_size,
+                                    egui::Button::new(pad_left_panel_button_label("Down")),
+                                )
                                 .clicked()
                             {
                                 self.jog_move(0.0, -1.0);
@@ -421,7 +503,7 @@ impl eframe::App for RustLaserApp {
 
                 ui.add_space(14.0);
                 ui.label("Extra Keys");
-                let matrix_button_size = egui::vec2(38.0, 30.0);
+                let matrix_button_size = egui::vec2(92.0, 30.0);
                 let matrix_gap = 4.0;
 
                 ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
@@ -436,16 +518,57 @@ impl eframe::App for RustLaserApp {
                                     } else {
                                         let button_id = (row - 1) * 3 + col;
                                         let label = if button_id == 1 {
-                                            "Home".to_string()
+                                            pad_left_panel_button_label("Home")
+                                        } else if button_id == 2 {
+                                            pad_left_panel_button_label("SReset")
+                                        } else if button_id == 3 {
+                                            pad_left_panel_button_label("Continue")
                                         } else {
-                                            format!("Button {button_id}")
+                                            pad_left_panel_button_label(&format!(
+                                                "Button {button_id}"
+                                            ))
                                         };
-                                        let clicked = ui
-                                            .add_sized(
+                                        let clicked = if button_id == 2
+                                            && self.controller_reset_required
+                                        {
+                                            ui.add_sized(
+                                                matrix_button_size,
+                                                egui::Button::new(
+                                                    egui::RichText::new(label.as_str())
+                                                        .strong()
+                                                        .color(egui::Color32::BLACK),
+                                                )
+                                                .fill(egui::Color32::from_rgb(255, 215, 64))
+                                                .stroke(egui::Stroke::new(
+                                                    1.5,
+                                                    egui::Color32::from_rgb(120, 100, 20),
+                                                )),
+                                            )
+                                            .clicked()
+                                        } else if button_id == 3
+                                            && self.controller_reset_required
+                                        {
+                                            ui.add_sized(
+                                                matrix_button_size,
+                                                egui::Button::new(
+                                                    egui::RichText::new(label.as_str())
+                                                        .strong()
+                                                        .color(egui::Color32::WHITE),
+                                                )
+                                                .fill(egui::Color32::from_rgb(32, 160, 80))
+                                                .stroke(egui::Stroke::new(
+                                                    1.5,
+                                                    egui::Color32::from_rgb(16, 96, 48),
+                                                )),
+                                            )
+                                            .clicked()
+                                        } else {
+                                            ui.add_sized(
                                                 matrix_button_size,
                                                 egui::Button::new(label.as_str()),
                                             )
-                                            .clicked();
+                                            .clicked()
+                                        };
                                         if clicked {
                                             if button_id == 1 {
                                                 if let Err(err) =
@@ -455,6 +578,14 @@ impl eframe::App for RustLaserApp {
                                                 {
                                                     self.serial_log
                                                         .push(format!("Home failed: {err}"));
+                                                }
+                                            } else if button_id == 2 {
+                                                if self.controller_reset_required {
+                                                    self.flush_controller();
+                                                }
+                                            } else if button_id == 3 {
+                                                if self.controller_reset_required {
+                                                    self.continue_program();
                                                 }
                                             } else {
                                                 self.serial_log.push(format!(
@@ -750,6 +881,24 @@ fn screen_to_world(
         canvas_center[0] + (point.x - plot.center().x) / scale,
         canvas_center[1] - (point.y - plot.center().y) / scale,
     ]
+}
+
+fn pad_left_panel_button_label(label: &str) -> String {
+    let len = label.chars().count();
+    if len >= LEFT_PANEL_BUTTON_LABEL_WIDTH {
+        return label.to_string();
+    }
+
+    let total_padding = LEFT_PANEL_BUTTON_LABEL_WIDTH - len;
+    let left_padding = total_padding / 2;
+    let right_padding = total_padding - left_padding;
+
+    format!(
+        "{}{}{}",
+        " ".repeat(left_padding),
+        label,
+        " ".repeat(right_padding)
+    )
 }
 
 fn gcode_to_polyline(lines: &[String]) -> Vec<[f32; 2]> {
