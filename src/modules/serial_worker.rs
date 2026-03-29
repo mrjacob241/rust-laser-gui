@@ -11,6 +11,8 @@ const STATUS_GUI_UPDATE_MS: u64 = 500;
 const STATUS_QUERY_MS: u64 = 200;
 const STREAM_POLL_MS: u64 = 20;
 const STREAM_STALL_TIMEOUT_SECS: u64 = 30;
+const LOOP_STREAK_LOOPS: usize = 2;
+const RX_EMPTY_FINISH_MS: u64 = 1000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum GcodeSerialCountMode {
@@ -56,6 +58,10 @@ pub enum SerialCommand {
     Home {
         feed: f32,
     },
+    LoopRectangle {
+        corners: [[f32; 2]; 2],
+        feed: f32,
+    },
 }
 
 pub enum SerialEvent {
@@ -67,6 +73,12 @@ pub enum SerialEvent {
         sent: usize,
         total: usize,
     },
+    RxBufferFill {
+        used: usize,
+        capacity: usize,
+    },
+    LoopStarted,
+    LoopStopped,
     PrintAborted,
     LaserPosition {
         position: [f32; 2],
@@ -96,7 +108,10 @@ impl SerialWorker {
     }
 
     pub fn send(&self, cmd: SerialCommand) -> Result<(), String> {
-        if matches!(cmd, SerialCommand::SendLoadedGcode { .. }) {
+        if matches!(
+            cmd,
+            SerialCommand::SendLoadedGcode { .. } | SerialCommand::LoopRectangle { .. }
+        ) {
             self.stop_requested.store(false, Ordering::SeqCst);
         }
         self.tx
@@ -174,6 +189,10 @@ fn worker_loop(
                     let _ = tx_evt.send(SerialEvent::Log(format!("Serial error: {err}")));
                     bridge.disconnect();
                     track_position_until_idle = false;
+                    let _ = tx_evt.send(SerialEvent::RxBufferFill {
+                        used: 0,
+                        capacity: GRBL_RX_LIMIT,
+                    });
                     let _ = tx_evt.send(SerialEvent::Connected(false));
                 }
             }
@@ -193,6 +212,10 @@ fn handle_command(
             *track_position_until_idle = false;
             if bridge.is_connected() {
                 bridge.disconnect();
+                let _ = tx_evt.send(SerialEvent::RxBufferFill {
+                    used: 0,
+                    capacity: GRBL_RX_LIMIT,
+                });
                 let _ = tx_evt.send(SerialEvent::Connected(false));
             }
             match bridge.connect(&address, baud) {
@@ -211,6 +234,10 @@ fn handle_command(
         SerialCommand::Disconnect => {
             *track_position_until_idle = false;
             bridge.disconnect();
+            let _ = tx_evt.send(SerialEvent::RxBufferFill {
+                used: 0,
+                capacity: GRBL_RX_LIMIT,
+            });
             let _ = tx_evt.send(SerialEvent::Log("Disconnected.".to_string()));
             let _ = tx_evt.send(SerialEvent::Connected(false));
         }
@@ -239,6 +266,10 @@ fn handle_command(
                 Ok(()) => {
                     stop_requested.store(false, Ordering::SeqCst);
                     *track_position_until_idle = false;
+                    let _ = tx_evt.send(SerialEvent::RxBufferFill {
+                        used: 0,
+                        capacity: GRBL_RX_LIMIT,
+                    });
                     let _ = tx_evt.send(SerialEvent::Log(
                         "TX> Ctrl-X (soft reset / flush controller state)".to_string(),
                     ));
@@ -331,6 +362,9 @@ fn handle_command(
                 }
             }
         }
+        SerialCommand::LoopRectangle { corners, feed } => {
+            loop_rectangle_worker(bridge, tx_evt, corners, feed, stop_requested);
+        }
     }
 }
 
@@ -382,6 +416,10 @@ fn send_loaded_gcode_worker(
     let total = lines.len();
     let _ = tx_evt.send(SerialEvent::PrintStarted);
     let _ = tx_evt.send(SerialEvent::GcodeProgress { sent: 0, total });
+    let _ = tx_evt.send(SerialEvent::RxBufferFill {
+        used: 0,
+        capacity: GRBL_RX_LIMIT,
+    });
 
     let mut sent = 0_u64;
     let mut acked = 0_u64;
@@ -535,8 +573,9 @@ fn send_loaded_gcode_worker_rx(
     let mut last_progress = Instant::now();
     let mut rx_free_hint: Option<usize> = None;
     let mut reported_fallback = false;
-    let mut waiting_for_idle_after_send = false;
-    let mut saw_idle_after_send = false;
+    let mut waiting_for_rx_empty_after_send = false;
+    let mut rx_empty_since: Option<Instant> = None;
+    let mut rx_empty_wait_announced = false;
     let (status_tick_tx, status_tick_rx) = mpsc::channel::<()>();
     let (status_stop_tx, status_stop_rx) = mpsc::channel::<()>();
     let status_thread = thread::spawn(move || {
@@ -632,9 +671,16 @@ fn send_loaded_gcode_worker_rx(
             }
         }
 
-        if next_index >= lines.len() && in_flight.is_empty() {
-            waiting_for_idle_after_send = true;
-            if saw_idle_after_send {
+        if next_index >= lines.len() {
+            waiting_for_rx_empty_after_send = true;
+            if rx_empty_since.is_some_and(|since| {
+                Instant::now().duration_since(since)
+                    >= Duration::from_millis(RX_EMPTY_FINISH_MS)
+            }) {
+                let _ = tx_evt.send(SerialEvent::Log(format!(
+                    "STATUS> RX fill stayed at 0% for {} ms after 100% send; concluding print.",
+                    RX_EMPTY_FINISH_MS
+                )));
                 break;
             }
         }
@@ -690,15 +736,31 @@ fn send_loaded_gcode_worker_rx(
                     if text.starts_with('<') {
                         if let Some(report) = parse_grbl_status_report(text) {
                             last_progress = Instant::now();
-                            if waiting_for_idle_after_send
-                                && report.machine_state == Some(GrblMachineState::Idle)
-                            {
-                                saw_idle_after_send = true;
-                            }
                             if let Some(rx_free) = report.rx_free {
                                 let rx_free = rx_free.min(GRBL_RX_LIMIT);
                                 rx_free_hint = Some(rx_free);
                                 rx_used = GRBL_RX_LIMIT.saturating_sub(rx_free);
+                                let _ = tx_evt.send(SerialEvent::RxBufferFill {
+                                    used: rx_used,
+                                    capacity: GRBL_RX_LIMIT,
+                                });
+                                if waiting_for_rx_empty_after_send {
+                                    if rx_used == 0 {
+                                        if rx_empty_since.is_none() {
+                                            rx_empty_since = Some(Instant::now());
+                                            if !rx_empty_wait_announced {
+                                                let _ = tx_evt.send(SerialEvent::Log(format!(
+                                                    "STATUS> G-code send is 100% and RX fill is 0%; waiting {} ms before concluding print.",
+                                                    RX_EMPTY_FINISH_MS
+                                                )));
+                                                rx_empty_wait_announced = true;
+                                            }
+                                        }
+                                    } else {
+                                        rx_empty_since = None;
+                                        rx_empty_wait_announced = false;
+                                    }
+                                }
                             }
                             if let Some(position) = report.position {
                                 let _ = tx_evt.send(SerialEvent::LaserPosition { position });
@@ -731,10 +793,337 @@ fn send_loaded_gcode_worker_rx(
         "Stream completed ({mode}): sent {sent}, acked {acked}, rx_used {rx_used}/{GRBL_RX_LIMIT}, rx_free_hint {:?}.",
         rx_free_hint
     )));
+    let _ = tx_evt.send(SerialEvent::RxBufferFill {
+        used: 0,
+        capacity: GRBL_RX_LIMIT,
+    });
     let _ = tx_evt.send(SerialEvent::PrintFinished);
     let _ = tx_evt.send(SerialEvent::Log(
         "[Printing G-Code] completed successfully".to_string(),
     ));
+}
+
+fn loop_rectangle_worker(
+    bridge: &mut SerialBridge,
+    tx_evt: &Sender<SerialEvent>,
+    corners: [[f32; 2]; 2],
+    feed: f32,
+    stop_requested: &Arc<AtomicBool>,
+) {
+    let [a, c] = corners;
+    let min_x = a[0].min(c[0]);
+    let max_x = a[0].max(c[0]);
+    let min_y = a[1].min(c[1]);
+    let max_y = a[1].max(c[1]);
+
+    if (max_x - min_x).abs() <= f32::EPSILON || (max_y - min_y).abs() <= f32::EPSILON {
+        let _ = tx_evt.send(SerialEvent::Log(
+            "Loop rectangle requires two diagonal corners with non-zero width and height."
+                .to_string(),
+        ));
+        let _ = tx_evt.send(SerialEvent::LoopStopped);
+        return;
+    }
+
+    let loop_feed = feed.max(1.0);
+    let vertices = [
+        [min_x, min_y],
+        [max_x, min_y],
+        [max_x, max_y],
+        [min_x, max_y],
+    ];
+    let loop_lines = [
+        format!("G1 X{:.3} Y{:.3} F{:.0}", vertices[1][0], vertices[1][1], loop_feed),
+        format!("G1 X{:.3} Y{:.3} F{:.0}", vertices[2][0], vertices[2][1], loop_feed),
+        format!("G1 X{:.3} Y{:.3} F{:.0}", vertices[3][0], vertices[3][1], loop_feed),
+        format!("G1 X{:.3} Y{:.3} F{:.0}", vertices[0][0], vertices[0][1], loop_feed),
+    ];
+    let loop_bytes: usize = loop_lines.iter().map(|line| line.len() + 1).sum();
+    let target_rx_bytes = (loop_bytes * LOOP_STREAK_LOOPS).min(GRBL_RX_LIMIT);
+
+    let _ = tx_evt.send(SerialEvent::LoopStarted);
+    let _ = tx_evt.send(SerialEvent::Log(format!(
+        "Loop rectangle started: ({min_x:.2}, {min_y:.2}) -> ({max_x:.2}, {max_y:.2}) @ F{loop_feed:.0} with laser off, target queue {LOOP_STREAK_LOOPS} loop(s)."
+    )));
+
+    if let Err(err) = bridge.send_spindle_stop() {
+        let _ = tx_evt.send(SerialEvent::Log(format!(
+            "Laser-off request failed before loop start: {err}"
+        )));
+    }
+
+    if let Err(err) = send_blocking_line(bridge, tx_evt, "G90") {
+        let _ = tx_evt.send(SerialEvent::Log(format!("Loop setup failed: {err}")));
+        let _ = tx_evt.send(SerialEvent::LoopStopped);
+        return;
+    }
+
+    let move_to_start = format!("G1 X{:.3} Y{:.3} F{:.0}", vertices[0][0], vertices[0][1], loop_feed);
+    if let Err(err) = send_blocking_line(bridge, tx_evt, &move_to_start) {
+        let _ = tx_evt.send(SerialEvent::Log(format!("Loop start move failed: {err}")));
+        let _ = tx_evt.send(SerialEvent::LoopStopped);
+        return;
+    }
+
+    let (status_tick_tx, status_tick_rx) = mpsc::channel::<()>();
+    let (status_stop_tx, status_stop_rx) = mpsc::channel::<()>();
+    let status_thread = thread::spawn(move || {
+        loop {
+            match status_stop_rx.recv_timeout(Duration::from_millis(STATUS_QUERY_MS)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if status_tick_tx.send(()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut rx_used = 0_usize;
+    let mut rx_free_hint: Option<usize> = None;
+    let mut next_index = 0_usize;
+    let mut in_flight: VecDeque<usize> = VecDeque::new();
+    let mut last_activity = Instant::now();
+
+    'looping: loop {
+        if stop_requested.load(Ordering::SeqCst) {
+            break;
+        }
+
+        while status_tick_rx.try_recv().is_ok() {
+            if let Err(err) = bridge.send_status_query() {
+                let _ = tx_evt.send(SerialEvent::Log(format!(
+                    "Loop status query failed: {err}"
+                )));
+                break 'looping;
+            }
+        }
+
+        loop {
+            if stop_requested.load(Ordering::SeqCst) {
+                break 'looping;
+            }
+
+            let line = &loop_lines[next_index];
+            let bytes = line.len() + 1;
+            let local_rx_free = GRBL_RX_LIMIT.saturating_sub(rx_used);
+            let effective_rx_free = match rx_free_hint {
+                Some(rx_free) => local_rx_free.min(rx_free),
+                None => local_rx_free,
+            };
+
+            if rx_used + bytes > target_rx_bytes || bytes > effective_rx_free {
+                break;
+            }
+
+            match bridge.send_line(line) {
+                Ok(()) => {
+                    rx_used += bytes;
+                    in_flight.push_back(bytes);
+                    next_index = (next_index + 1) % loop_lines.len();
+                    last_activity = Instant::now();
+                    let _ = tx_evt.send(SerialEvent::RxBufferFill {
+                        used: rx_used,
+                        capacity: GRBL_RX_LIMIT,
+                    });
+                    if let Some(rx_free) = rx_free_hint.as_mut() {
+                        *rx_free = rx_free.saturating_sub(bytes);
+                    }
+                }
+                Err(err) => {
+                    let _ = tx_evt.send(SerialEvent::Log(format!("Loop move failed: {err}")));
+                    break 'looping;
+                }
+            }
+        }
+
+        if Instant::now().duration_since(last_activity)
+            > Duration::from_secs(STREAM_STALL_TIMEOUT_SECS)
+        {
+            let _ = tx_evt.send(SerialEvent::Log(
+                "Loop stream stalled waiting for controller progress.".to_string(),
+            ));
+            break;
+        }
+
+        match bridge.poll_reply(STREAM_POLL_MS) {
+            Ok(Some(reply)) => {
+                for raw_line in reply.lines() {
+                    let text = raw_line.trim();
+                    if text.is_empty() {
+                        continue;
+                    }
+
+                    let lower = text.to_ascii_lowercase();
+                    if lower == "ok" || lower.starts_with("error:") {
+                        if let Some(bytes) = in_flight.pop_front() {
+                            rx_used = rx_used.saturating_sub(bytes);
+                            last_activity = Instant::now();
+                            let _ = tx_evt.send(SerialEvent::RxBufferFill {
+                                used: rx_used,
+                                capacity: GRBL_RX_LIMIT,
+                            });
+                            if let Some(rx_free) = rx_free_hint.as_mut() {
+                                *rx_free = (*rx_free + bytes).min(GRBL_RX_LIMIT);
+                            }
+                        }
+
+                        if lower.starts_with("error:") {
+                            let _ = tx_evt.send(SerialEvent::Log(format!(
+                                "Loop device error: {text}"
+                            )));
+                            break 'looping;
+                        }
+                        continue;
+                    }
+
+                    if text.starts_with('<') {
+                        if let Some(report) = parse_grbl_status_report(text) {
+                            last_activity = Instant::now();
+                            if let Some(rx_free) = report.rx_free {
+                                let rx_free = rx_free.min(GRBL_RX_LIMIT);
+                                rx_free_hint = Some(rx_free);
+                                rx_used = GRBL_RX_LIMIT.saturating_sub(rx_free);
+                                let _ = tx_evt.send(SerialEvent::RxBufferFill {
+                                    used: rx_used,
+                                    capacity: GRBL_RX_LIMIT,
+                                });
+                            }
+                            if let Some(position) = report.position {
+                                let _ = tx_evt.send(SerialEvent::LaserPosition { position });
+                            }
+                        }
+                        continue;
+                    }
+
+                    let _ = tx_evt.send(SerialEvent::Log(format!("RX> {text}")));
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                let _ = tx_evt.send(SerialEvent::Log(format!("Loop receive failed: {err}")));
+                break;
+            }
+        }
+    }
+
+    let _ = status_stop_tx.send(());
+    let _ = status_thread.join();
+    if stop_requested.load(Ordering::SeqCst) {
+        stop_loop_stream(bridge, tx_evt, stop_requested);
+        let _ = tx_evt.send(SerialEvent::LoopStopped);
+        let _ = tx_evt.send(SerialEvent::RxBufferFill {
+            used: 0,
+            capacity: GRBL_RX_LIMIT,
+        });
+        return;
+    }
+    if let Err(err) = bridge.send_spindle_stop() {
+        let _ = tx_evt.send(SerialEvent::Log(format!(
+            "Laser-off request failed after loop stop: {err}"
+        )));
+    }
+    let _ = tx_evt.send(SerialEvent::LoopStopped);
+    let _ = tx_evt.send(SerialEvent::RxBufferFill {
+        used: 0,
+        capacity: GRBL_RX_LIMIT,
+    });
+    let _ = tx_evt.send(SerialEvent::Log("Loop rectangle stopped.".to_string()));
+    stop_requested.store(false, Ordering::SeqCst);
+}
+
+fn stop_loop_stream(
+    bridge: &mut SerialBridge,
+    tx_evt: &Sender<SerialEvent>,
+    stop_requested: &Arc<AtomicBool>,
+) {
+    match bridge.send_feed_hold() {
+        Ok(()) => {
+            let _ = tx_evt.send(SerialEvent::Log("TX> ! (feed hold)".to_string()));
+        }
+        Err(err) => {
+            let _ = tx_evt.send(SerialEvent::Log(format!("Stop failed: {err}")));
+        }
+    }
+    match bridge.send_spindle_stop() {
+        Ok(()) => {
+            let _ = tx_evt.send(SerialEvent::Log(
+                "TX> spindle/laser stop override".to_string(),
+            ));
+        }
+        Err(err) => {
+            let _ = tx_evt.send(SerialEvent::Log(format!(
+                "Laser-off request failed after stop: {err}"
+            )));
+        }
+    }
+    match bridge.send_soft_reset() {
+        Ok(()) => {
+            let _ = tx_evt.send(SerialEvent::Log(
+                "TX> Ctrl-X (soft reset after loop stop)".to_string(),
+            ));
+        }
+        Err(err) => {
+            let _ = tx_evt.send(SerialEvent::Log(format!(
+                "Loop reset failed: {err}"
+            )));
+        }
+    }
+    let _ = tx_evt.send(SerialEvent::Log(
+        "[Loop Rectangle] stopped by stop request and reset".to_string(),
+    ));
+    stop_requested.store(false, Ordering::SeqCst);
+}
+
+fn send_blocking_line(
+    bridge: &mut SerialBridge,
+    tx_evt: &Sender<SerialEvent>,
+    line: &str,
+) -> Result<(), String> {
+    bridge.send_line(line)?;
+    wait_for_serial_ack(bridge, tx_evt)
+}
+
+fn wait_for_serial_ack(bridge: &mut SerialBridge, tx_evt: &Sender<SerialEvent>) -> Result<(), String> {
+    let start = Instant::now();
+    loop {
+        if Instant::now().duration_since(start) > Duration::from_secs(STREAM_STALL_TIMEOUT_SECS) {
+            return Err("Timed out waiting for controller acknowledgement".to_string());
+        }
+
+        match bridge.poll_reply(STREAM_POLL_MS) {
+            Ok(Some(reply)) => {
+                for raw_line in reply.lines() {
+                    let text = raw_line.trim();
+                    if text.is_empty() {
+                        continue;
+                    }
+
+                    let lower = text.to_ascii_lowercase();
+                    if lower == "ok" {
+                        return Ok(());
+                    }
+                    if lower.starts_with("error:") {
+                        return Err(format!("Device error: {text}"));
+                    }
+
+                    if text.starts_with('<') {
+                        if let Some(report) = parse_grbl_status_report(text) {
+                            if let Some(position) = report.position {
+                                let _ = tx_evt.send(SerialEvent::LaserPosition { position });
+                            }
+                        }
+                        continue;
+                    }
+
+                    let _ = tx_evt.send(SerialEvent::Log(format!("RX> {text}")));
+                }
+            }
+            Ok(None) => {}
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 fn stop_stream(
@@ -763,6 +1152,10 @@ fn stop_stream(
         }
     }
     let _ = tx_evt.send(SerialEvent::PrintAborted);
+    let _ = tx_evt.send(SerialEvent::RxBufferFill {
+        used: 0,
+        capacity: GRBL_RX_LIMIT,
+    });
     let _ = tx_evt.send(SerialEvent::Log(
         "[Printing G-Code] aborted by stop request".to_string(),
     ));

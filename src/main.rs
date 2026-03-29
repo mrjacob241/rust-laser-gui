@@ -15,7 +15,7 @@ const LEFT_PANEL_BUTTON_LABEL_WIDTH: usize = "Button 0".len();
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("RustLaser GUI v0.2")
+            .with_title("RustLaser GUI v0.3")
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([1024.0, 700.0]),
         ..Default::default()
@@ -48,8 +48,14 @@ struct RustLaserApp {
     show_workspace_axes: bool,
     session_config: SessionConfig,
     print_active: bool,
+    loop_active: bool,
+    loop_selecting: bool,
+    loop_selection_anchor: Option<[f32; 2]>,
+    loop_rectangle: Option<[[f32; 2]; 2]>,
     gcode_progress_sent: usize,
     gcode_progress_total: usize,
+    rx_buffer_used: usize,
+    rx_buffer_capacity: usize,
     laser_position: Option<[f32; 2]>,
     controller_reset_required: bool,
 }
@@ -82,8 +88,14 @@ impl RustLaserApp {
                 gcode_serial_count_mode: GcodeSerialCountMode::RxLogs,
             },
             print_active: false,
+            loop_active: false,
+            loop_selecting: false,
+            loop_selection_anchor: None,
+            loop_rectangle: None,
             gcode_progress_sent: 0,
             gcode_progress_total: 0,
+            rx_buffer_used: 0,
+            rx_buffer_capacity: 127,
             laser_position: None,
             controller_reset_required: false,
         }
@@ -152,6 +164,7 @@ impl RustLaserApp {
         ));
         self.gcode_progress_sent = 0;
         self.gcode_progress_total = self.gcode_lines.len();
+        self.rx_buffer_used = 0;
         self.laser_position = None;
         if let Err(err) = self
             .serial_worker
@@ -175,10 +188,78 @@ impl RustLaserApp {
         self.canvas_zoom = 1.0;
     }
 
+    fn loop_feed(&self) -> f32 {
+        self.jog_feed.clamp(300.0, 1200.0)
+    }
+
+    fn toggle_loop_mode(&mut self) {
+        if self.loop_selecting {
+            self.loop_selecting = false;
+            self.loop_selection_anchor = None;
+            self.loop_rectangle = None;
+            self.status = "Loop selection cancelled.".to_string();
+            return;
+        }
+
+        if self.loop_active {
+            self.serial_worker.request_stop();
+            self.loop_rectangle = None;
+            self.status = "Loop stop requested. Controller reset will be sent automatically."
+                .to_string();
+            return;
+        }
+
+        self.loop_selecting = true;
+        self.loop_selection_anchor = None;
+        self.loop_rectangle = None;
+        self.status =
+            "Loop mode armed. Click two diagonal rectangle corners in the workspace.".to_string();
+    }
+
+    fn handle_loop_selection_click(&mut self, point: [f32; 2]) {
+        if !self.loop_selecting {
+            return;
+        }
+
+        if let Some(anchor) = self.loop_selection_anchor {
+            if (anchor[0] - point[0]).abs() <= f32::EPSILON
+                || (anchor[1] - point[1]).abs() <= f32::EPSILON
+            {
+                self.status =
+                    "Loop rectangle needs non-zero width and height. Pick a different second corner."
+                        .to_string();
+                return;
+            }
+
+            let rectangle = [anchor, point];
+            self.loop_rectangle = Some(rectangle);
+            self.loop_selection_anchor = None;
+            self.loop_selecting = false;
+            self.loop_active = true;
+            self.status = format!(
+                "Loop rectangle started at F{:.0}. Press Stop Loop to stop.",
+                self.loop_feed()
+            );
+            if let Err(err) = self.serial_worker.send(SerialCommand::LoopRectangle {
+                corners: rectangle,
+                feed: self.loop_feed(),
+            }) {
+                self.loop_active = false;
+                self.loop_rectangle = None;
+                self.serial_log.push(format!("Loop start failed: {err}"));
+            }
+        } else {
+            self.loop_selection_anchor = Some(point);
+            self.loop_rectangle = Some([point, point]);
+            self.status = "Loop mode: pick the opposite corner.".to_string();
+        }
+    }
+
     fn handle_print_aborted(&mut self) {
         self.print_active = false;
         self.gcode_progress_sent = 0;
         self.gcode_progress_total = 0;
+        self.rx_buffer_used = 0;
         self.laser_position = None;
         self.status =
             "Job stopped. Controller is likely in feed-hold; flush/reset to start a new session."
@@ -214,12 +295,39 @@ impl eframe::App for RustLaserApp {
         while let Some(event) = self.serial_worker.try_recv() {
             match event {
                 SerialEvent::Log(line) => self.serial_log.push(line),
-                SerialEvent::Connected(state) => self.serial_connected = state,
-                SerialEvent::PrintStarted => self.print_active = true,
-                SerialEvent::PrintFinished => self.print_active = false,
+                SerialEvent::Connected(state) => {
+                    self.serial_connected = state;
+                    if !state {
+                        self.rx_buffer_used = 0;
+                    }
+                }
+                SerialEvent::PrintStarted => {
+                    self.print_active = true;
+                    self.rx_buffer_used = 0;
+                }
+                SerialEvent::PrintFinished => {
+                    self.print_active = false;
+                    self.rx_buffer_used = 0;
+                }
                 SerialEvent::GcodeProgress { sent, total } => {
                     self.gcode_progress_sent = sent;
                     self.gcode_progress_total = total;
+                }
+                SerialEvent::RxBufferFill { used, capacity } => {
+                    self.rx_buffer_used = used;
+                    self.rx_buffer_capacity = capacity;
+                }
+                SerialEvent::LoopStarted => {
+                    self.loop_active = true;
+                }
+                SerialEvent::LoopStopped => {
+                    self.loop_active = false;
+                    self.loop_selecting = false;
+                    self.loop_selection_anchor = None;
+                    self.controller_reset_required = false;
+                    if !self.print_active {
+                        self.status = "Loop rectangle stopped.".to_string();
+                    }
                 }
                 SerialEvent::PrintAborted => self.handle_print_aborted(),
                 SerialEvent::LaserPosition { position } => {
@@ -228,7 +336,7 @@ impl eframe::App for RustLaserApp {
             }
         }
 
-        if self.is_printing() {
+        if self.is_printing() || self.loop_active {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
 
@@ -388,6 +496,23 @@ impl eframe::App for RustLaserApp {
                                     self.gcode_progress_sent, self.gcode_progress_total
                                 )),
                         );
+
+                        ui.add_space(8.0);
+                        ui.label("Controller RX fill");
+                        let rx_fill = if self.rx_buffer_capacity > 0 {
+                            self.rx_buffer_used as f32 / self.rx_buffer_capacity as f32
+                        } else {
+                            0.0
+                        };
+                        let rx_fill_percent = rx_fill * 100.0;
+                        ui.add(
+                            egui::ProgressBar::new(rx_fill)
+                                .desired_width(ui.available_width())
+                                .text(format!(
+                                    "{} / {} ({rx_fill_percent:.0}%)",
+                                    self.rx_buffer_used, self.rx_buffer_capacity
+                                )),
+                        );
                     });
                 });
             });
@@ -523,6 +648,14 @@ impl eframe::App for RustLaserApp {
                                             pad_left_panel_button_label("SReset")
                                         } else if button_id == 3 {
                                             pad_left_panel_button_label("Continue")
+                                        } else if button_id == 4 {
+                                            pad_left_panel_button_label(if self.loop_active
+                                                || self.loop_selecting
+                                            {
+                                                "Stop Loop"
+                                            } else {
+                                                "Loop"
+                                            })
                                         } else {
                                             pad_left_panel_button_label(&format!(
                                                 "Button {button_id}"
@@ -543,6 +676,19 @@ impl eframe::App for RustLaserApp {
                                                     1.5,
                                                     egui::Color32::from_rgb(120, 100, 20),
                                                 )),
+                                            )
+                                            .clicked()
+                                        } else if button_id == 4
+                                            && (self.loop_active || self.loop_selecting)
+                                        {
+                                            ui.add_sized(
+                                                matrix_button_size,
+                                                egui::Button::new(
+                                                    egui::RichText::new(label.as_str())
+                                                        .strong()
+                                                        .color(egui::Color32::WHITE),
+                                                )
+                                                .fill(egui::Color32::from_rgb(180, 40, 40)),
                                             )
                                             .clicked()
                                         } else if button_id == 3
@@ -587,6 +733,8 @@ impl eframe::App for RustLaserApp {
                                                 if self.controller_reset_required {
                                                     self.continue_program();
                                                 }
+                                            } else if button_id == 4 {
+                                                self.toggle_loop_mode();
                                             } else {
                                                 self.serial_log.push(format!(
                                                     "Matrix button ({row},{col}) pressed"
@@ -671,7 +819,7 @@ impl eframe::App for RustLaserApp {
 
             let margin = 28.0;
             let size = ui.available_size();
-            let (rect, response) = ui.allocate_exact_size(size, egui::Sense::drag());
+            let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
             let painter = ui.painter_at(rect);
 
             let frame = rect.shrink(margin);
@@ -708,6 +856,17 @@ impl eframe::App for RustLaserApp {
                         self.canvas_center[0] = world_before[0] - offset_x;
                         self.canvas_center[1] = world_before[1] - offset_y;
                     }
+                }
+            }
+
+            if response.clicked() {
+                if let Some(pointer) = response.interact_pointer_pos() {
+                    let world = clamp_world_to_workspace(
+                        screen_to_world(pointer, plot, self.canvas_center, scale),
+                        x_max,
+                        y_max,
+                    );
+                    self.handle_loop_selection_click(world);
                 }
             }
 
@@ -825,13 +984,48 @@ impl eframe::App for RustLaserApp {
                 clipped.circle_filled(p, 2.5, egui::Color32::from_rgb(55, 145, 255));
             }
 
-            let show_laser_marker = self.session_config.gcode_serial_count_mode
+            let preview_rectangle = if self.loop_selecting {
+                if let Some(anchor) = self.loop_selection_anchor {
+                    response.hover_pos().map(|pointer| {
+                        [
+                            anchor,
+                            clamp_world_to_workspace(
+                                screen_to_world(pointer, plot, self.canvas_center, scale),
+                                x_max,
+                                y_max,
+                            ),
+                        ]
+                    })
+                } else {
+                    self.loop_rectangle
+                }
+            } else {
+                self.loop_rectangle
+            };
+
+            if let Some(rectangle) = preview_rectangle {
+                draw_loop_rectangle(
+                    &clipped,
+                    rectangle,
+                    plot,
+                    self.canvas_center,
+                    scale,
+                    self.loop_active,
+                );
+            }
+
+            let show_laser_marker = (self.session_config.gcode_serial_count_mode
                 == GcodeSerialCountMode::RxLogs
-                && self.is_printing();
+                && self.is_printing())
+                || self.loop_active;
             if show_laser_marker {
                 if let Some(position) = self.laser_position {
                     let p = world_to_screen(position, plot, self.canvas_center, scale);
-                    let marker_color = egui::Color32::from_rgb(255, 120, 80);
+                    let marker_color = if self.loop_active {
+                        egui::Color32::from_rgb(72, 210, 96)
+                    } else {
+                        egui::Color32::from_rgb(255, 120, 80)
+                    };
                     let marker_radius = 7.0;
                     clipped.circle_stroke(p, marker_radius, egui::Stroke::new(2.0, marker_color));
                     clipped.line_segment(
@@ -881,6 +1075,38 @@ fn screen_to_world(
         canvas_center[0] + (point.x - plot.center().x) / scale,
         canvas_center[1] - (point.y - plot.center().y) / scale,
     ]
+}
+
+fn clamp_world_to_workspace(point: [f32; 2], x_max: f32, y_max: f32) -> [f32; 2] {
+    [point[0].clamp(0.0, x_max), point[1].clamp(0.0, y_max)]
+}
+
+fn draw_loop_rectangle(
+    painter: &egui::Painter,
+    rectangle: [[f32; 2]; 2],
+    plot: egui::Rect,
+    canvas_center: [f32; 2],
+    scale: f32,
+    active: bool,
+) {
+    let [a, b] = rectangle;
+    let min_x = a[0].min(b[0]);
+    let max_x = a[0].max(b[0]);
+    let min_y = a[1].min(b[1]);
+    let max_y = a[1].max(b[1]);
+
+    let top_left = world_to_screen([min_x, max_y], plot, canvas_center, scale);
+    let bottom_right = world_to_screen([max_x, min_y], plot, canvas_center, scale);
+    let stroke = if active {
+        egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 220, 64))
+    } else {
+        egui::Stroke::new(1.8, egui::Color32::from_rgb(255, 210, 72))
+    };
+    painter.rect_stroke(
+        egui::Rect::from_two_pos(top_left, bottom_right),
+        0.0,
+        stroke,
+    );
 }
 
 fn pad_left_panel_button_label(label: &str) -> String {
