@@ -32,6 +32,7 @@ impl GcodeSerialCountMode {
 #[derive(Clone, Copy)]
 pub struct SessionConfig {
     pub gcode_serial_count_mode: GcodeSerialCountMode,
+    pub no_rx_prompt_exit: bool,
 }
 
 pub enum SerialCommand {
@@ -69,6 +70,7 @@ pub enum SerialEvent {
     Connected(bool),
     PrintStarted,
     PrintFinished,
+    RxFallbackContinuePrompt,
     GcodeProgress {
         sent: usize,
         total: usize,
@@ -89,6 +91,8 @@ pub struct SerialWorker {
     tx: Sender<SerialCommand>,
     rx: Receiver<SerialEvent>,
     stop_requested: Arc<AtomicBool>,
+    stop_reset_requested: Arc<AtomicBool>,
+    fallback_continue_requested: Arc<AtomicBool>,
 }
 
 impl SerialWorker {
@@ -97,13 +101,27 @@ impl SerialWorker {
         let (tx_evt, rx_evt) = mpsc::channel::<SerialEvent>();
         let stop_requested = Arc::new(AtomicBool::new(false));
         let worker_stop_requested = Arc::clone(&stop_requested);
+        let stop_reset_requested = Arc::new(AtomicBool::new(false));
+        let worker_stop_reset_requested = Arc::clone(&stop_reset_requested);
+        let fallback_continue_requested = Arc::new(AtomicBool::new(false));
+        let worker_fallback_continue_requested = Arc::clone(&fallback_continue_requested);
 
-        thread::spawn(move || worker_loop(rx_cmd, tx_evt, worker_stop_requested));
+        thread::spawn(move || {
+            worker_loop(
+                rx_cmd,
+                tx_evt,
+                worker_stop_requested,
+                worker_stop_reset_requested,
+                worker_fallback_continue_requested,
+            )
+        });
 
         Self {
             tx: tx_cmd,
             rx: rx_evt,
             stop_requested,
+            stop_reset_requested,
+            fallback_continue_requested,
         }
     }
 
@@ -113,6 +131,9 @@ impl SerialWorker {
             SerialCommand::SendLoadedGcode { .. } | SerialCommand::LoopRectangle { .. }
         ) {
             self.stop_requested.store(false, Ordering::SeqCst);
+            self.stop_reset_requested.store(false, Ordering::SeqCst);
+            self.fallback_continue_requested
+                .store(false, Ordering::SeqCst);
         }
         self.tx
             .send(cmd)
@@ -121,6 +142,17 @@ impl SerialWorker {
 
     pub fn request_stop(&self) {
         self.stop_requested.store(true, Ordering::SeqCst);
+        self.stop_reset_requested.store(false, Ordering::SeqCst);
+    }
+
+    pub fn request_stop_with_reset(&self) {
+        self.stop_reset_requested.store(true, Ordering::SeqCst);
+        self.stop_requested.store(true, Ordering::SeqCst);
+    }
+
+    pub fn confirm_fallback_continue(&self) {
+        self.fallback_continue_requested
+            .store(true, Ordering::SeqCst);
     }
 
     pub fn try_recv(&self) -> Option<SerialEvent> {
@@ -132,6 +164,8 @@ fn worker_loop(
     rx_cmd: Receiver<SerialCommand>,
     tx_evt: Sender<SerialEvent>,
     stop_requested: Arc<AtomicBool>,
+    stop_reset_requested: Arc<AtomicBool>,
+    fallback_continue_requested: Arc<AtomicBool>,
 ) {
     let mut bridge = SerialBridge::new();
     let mut track_position_until_idle = false;
@@ -144,6 +178,8 @@ fn worker_loop(
                 &mut bridge,
                 &tx_evt,
                 &stop_requested,
+                &stop_reset_requested,
+                &fallback_continue_requested,
                 &mut track_position_until_idle,
             ),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -205,6 +241,8 @@ fn handle_command(
     bridge: &mut SerialBridge,
     tx_evt: &Sender<SerialEvent>,
     stop_requested: &Arc<AtomicBool>,
+    stop_reset_requested: &Arc<AtomicBool>,
+    fallback_continue_requested: &Arc<AtomicBool>,
     track_position_until_idle: &mut bool,
 ) {
     match cmd {
@@ -254,10 +292,24 @@ fn handle_command(
             session_config,
         } => match session_config.gcode_serial_count_mode {
             GcodeSerialCountMode::CharCount => {
-                send_loaded_gcode_worker(bridge, tx_evt, &lines, stop_requested);
+                send_loaded_gcode_worker(
+                    bridge,
+                    tx_evt,
+                    &lines,
+                    stop_requested,
+                    stop_reset_requested,
+                );
             }
             GcodeSerialCountMode::RxLogs => {
-                send_loaded_gcode_worker_rx(bridge, tx_evt, &lines, stop_requested);
+                send_loaded_gcode_worker_rx(
+                    bridge,
+                    tx_evt,
+                    &lines,
+                    session_config,
+                    stop_requested,
+                    stop_reset_requested,
+                    fallback_continue_requested,
+                );
             }
         },
         SerialCommand::FlushController => {
@@ -265,6 +317,7 @@ fn handle_command(
             match result {
                 Ok(()) => {
                     stop_requested.store(false, Ordering::SeqCst);
+                    stop_reset_requested.store(false, Ordering::SeqCst);
                     *track_position_until_idle = false;
                     let _ = tx_evt.send(SerialEvent::RxBufferFill {
                         used: 0,
@@ -282,6 +335,7 @@ fn handle_command(
         SerialCommand::ContinueProgram => match bridge.send_cycle_start() {
             Ok(()) => {
                 stop_requested.store(false, Ordering::SeqCst);
+                stop_reset_requested.store(false, Ordering::SeqCst);
                 *track_position_until_idle = true;
                 let _ = tx_evt.send(SerialEvent::Log("TX> ~ (cycle start)".to_string()));
                 let _ = tx_evt.send(SerialEvent::PrintStarted);
@@ -333,6 +387,7 @@ fn handle_command(
         SerialCommand::JogStop => match bridge.send_feed_hold() {
             Ok(()) => {
                 stop_requested.store(false, Ordering::SeqCst);
+                stop_reset_requested.store(false, Ordering::SeqCst);
                 let _ = tx_evt.send(SerialEvent::Log("TX> ! (feed hold)".to_string()));
                 if let Err(err) = bridge.send_spindle_stop() {
                     let _ = tx_evt.send(SerialEvent::Log(format!(
@@ -406,6 +461,7 @@ fn send_loaded_gcode_worker(
     tx_evt: &Sender<SerialEvent>,
     lines: &[String],
     stop_requested: &Arc<AtomicBool>,
+    stop_reset_requested: &Arc<AtomicBool>,
 ) {
     if lines.is_empty() {
         let _ = tx_evt.send(SerialEvent::GcodeProgress { sent: 0, total: 0 });
@@ -431,14 +487,14 @@ fn send_loaded_gcode_worker(
 
     loop {
         if stop_requested.load(Ordering::SeqCst) {
-            stop_stream(bridge, tx_evt, stop_requested);
+            stop_stream(bridge, tx_evt, stop_requested, stop_reset_requested);
             return;
         }
 
         // Character-counting: keep RX near full without overflow.
         while next_index < lines.len() {
             if stop_requested.load(Ordering::SeqCst) {
-                stop_stream(bridge, tx_evt, stop_requested);
+                stop_stream(bridge, tx_evt, stop_requested, stop_reset_requested);
                 return;
             }
             let line = lines[next_index].clone();
@@ -553,7 +609,10 @@ fn send_loaded_gcode_worker_rx(
     bridge: &mut SerialBridge,
     tx_evt: &Sender<SerialEvent>,
     lines: &[String],
+    session_config: SessionConfig,
     stop_requested: &Arc<AtomicBool>,
+    stop_reset_requested: &Arc<AtomicBool>,
+    fallback_continue_requested: &Arc<AtomicBool>,
 ) {
     if lines.is_empty() {
         let _ = tx_evt.send(SerialEvent::GcodeProgress { sent: 0, total: 0 });
@@ -576,6 +635,9 @@ fn send_loaded_gcode_worker_rx(
     let mut waiting_for_rx_empty_after_send = false;
     let mut rx_empty_since: Option<Instant> = None;
     let mut rx_empty_wait_announced = false;
+    let mut fallback_prompt_pending = false;
+    let mut fallback_continue_tracking = false;
+    let mut fallback_continue_idle_detected = false;
     let (status_tick_tx, status_tick_rx) = mpsc::channel::<()>();
     let (status_stop_tx, status_stop_rx) = mpsc::channel::<()>();
     let status_thread = thread::spawn(move || {
@@ -595,7 +657,7 @@ fn send_loaded_gcode_worker_rx(
         if stop_requested.load(Ordering::SeqCst) {
             let _ = status_stop_tx.send(());
             let _ = status_thread.join();
-            stop_stream(bridge, tx_evt, stop_requested);
+            stop_stream(bridge, tx_evt, stop_requested, stop_reset_requested);
             return;
         }
 
@@ -612,7 +674,7 @@ fn send_loaded_gcode_worker_rx(
             if stop_requested.load(Ordering::SeqCst) {
                 let _ = status_stop_tx.send(());
                 let _ = status_thread.join();
-                stop_stream(bridge, tx_evt, stop_requested);
+                stop_stream(bridge, tx_evt, stop_requested, stop_reset_requested);
                 return;
             }
             let line = lines[next_index].clone();
@@ -672,16 +734,43 @@ fn send_loaded_gcode_worker_rx(
         }
 
         if next_index >= lines.len() {
-            waiting_for_rx_empty_after_send = true;
-            if rx_empty_since.is_some_and(|since| {
-                Instant::now().duration_since(since)
-                    >= Duration::from_millis(RX_EMPTY_FINISH_MS)
-            }) {
-                let _ = tx_evt.send(SerialEvent::Log(format!(
-                    "STATUS> RX fill stayed at 0% for {} ms after 100% send; concluding print.",
-                    RX_EMPTY_FINISH_MS
-                )));
-                break;
+            if rx_free_hint.is_some() {
+                waiting_for_rx_empty_after_send = true;
+                if rx_empty_since.is_some_and(|since| {
+                    Instant::now().duration_since(since)
+                        >= Duration::from_millis(RX_EMPTY_FINISH_MS)
+                }) {
+                    let _ = tx_evt.send(SerialEvent::Log(format!(
+                        "STATUS> RX fill stayed at 0% for {} ms after 100% send; concluding print.",
+                        RX_EMPTY_FINISH_MS
+                    )));
+                    break;
+                }
+            } else if !fallback_continue_tracking {
+                if session_config.no_rx_prompt_exit {
+                    let _ = tx_evt.send(SerialEvent::Log(
+                        "STATUS> 100% send reached without RX buffer status fields; `No RX Prompt Exit` is enabled, concluding print immediately."
+                            .to_string(),
+                    ));
+                    break;
+                }
+                if !fallback_prompt_pending {
+                    fallback_prompt_pending = true;
+                    let _ = tx_evt.send(SerialEvent::Log(
+                        "STATUS> 100% send reached without RX buffer status fields; waiting for user confirmation to continue or stop."
+                            .to_string(),
+                    ));
+                    let _ = tx_evt.send(SerialEvent::RxFallbackContinuePrompt);
+                }
+
+                if fallback_continue_requested.swap(false, Ordering::SeqCst) {
+                    fallback_prompt_pending = false;
+                    fallback_continue_tracking = true;
+                    let _ = tx_evt.send(SerialEvent::Log(
+                        "STATUS> User chose Continue; tracking controller status until Idle because RX buffer fields are unavailable."
+                            .to_string(),
+                    ));
+                }
             }
         }
 
@@ -765,6 +854,17 @@ fn send_loaded_gcode_worker_rx(
                             if let Some(position) = report.position {
                                 let _ = tx_evt.send(SerialEvent::LaserPosition { position });
                             }
+                            if fallback_continue_tracking
+                                && next_index >= lines.len()
+                                && report.machine_state == Some(GrblMachineState::Idle)
+                            {
+                                let _ = tx_evt.send(SerialEvent::Log(
+                                    "STATUS> Controller reported Idle after user-approved fallback continue; concluding print."
+                                        .to_string(),
+                                ));
+                                fallback_continue_idle_detected = true;
+                                break;
+                            }
                         }
                         continue;
                     }
@@ -780,6 +880,11 @@ fn send_loaded_gcode_worker_rx(
                 return;
             }
         }
+
+        if fallback_continue_idle_detected {
+            break;
+        }
+
     }
 
     let _ = status_stop_tx.send(());
@@ -1130,6 +1235,7 @@ fn stop_stream(
     bridge: &mut SerialBridge,
     tx_evt: &Sender<SerialEvent>,
     stop_requested: &Arc<AtomicBool>,
+    stop_reset_requested: &Arc<AtomicBool>,
 ) {
     match bridge.send_feed_hold() {
         Ok(()) => {
@@ -1151,15 +1257,33 @@ fn stop_stream(
             )));
         }
     }
+    if stop_reset_requested.load(Ordering::SeqCst) {
+        match bridge.send_soft_reset() {
+            Ok(()) => {
+                let _ = tx_evt.send(SerialEvent::Log(
+                    "TX> Ctrl-X (soft reset after popup stop)".to_string(),
+                ));
+            }
+            Err(err) => {
+                let _ = tx_evt.send(SerialEvent::Log(format!(
+                    "Reset failed after stop: {err}"
+                )));
+            }
+        }
+    }
     let _ = tx_evt.send(SerialEvent::PrintAborted);
     let _ = tx_evt.send(SerialEvent::RxBufferFill {
         used: 0,
         capacity: GRBL_RX_LIMIT,
     });
-    let _ = tx_evt.send(SerialEvent::Log(
-        "[Printing G-Code] aborted by stop request".to_string(),
-    ));
+    let abort_message = if stop_reset_requested.load(Ordering::SeqCst) {
+        "[Printing G-Code] aborted by stop request and soft reset".to_string()
+    } else {
+        "[Printing G-Code] aborted by stop request".to_string()
+    };
+    let _ = tx_evt.send(SerialEvent::Log(abort_message));
     stop_requested.store(false, Ordering::SeqCst);
+    stop_reset_requested.store(false, Ordering::SeqCst);
 }
 
 #[derive(Debug, Default, Clone, Copy)]

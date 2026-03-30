@@ -6,7 +6,10 @@ use modules::serial_worker::{
     GcodeSerialCountMode, SerialCommand, SerialEvent, SerialWorker, SessionConfig,
 };
 use rfd::FileDialog;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::Command;
 use std::time::Duration;
 
 const JOG_STEP_LUT: [f32; 4] = [0.01, 0.1, 1.0, 10.0];
@@ -15,7 +18,7 @@ const LEFT_PANEL_BUTTON_LABEL_WIDTH: usize = "Button 0".len();
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("RustLaser GUI v0.3")
+            .with_title("RustLaser GUI v0.4")
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([1024.0, 700.0]),
         ..Default::default()
@@ -58,6 +61,10 @@ struct RustLaserApp {
     rx_buffer_capacity: usize,
     laser_position: Option<[f32; 2]>,
     controller_reset_required: bool,
+    is_debug_mode: bool,
+    telemetry_enabled: bool,
+    telemetry_log_path: PathBuf,
+    rx_fallback_prompt_open: bool,
 }
 
 impl RustLaserApp {
@@ -65,8 +72,9 @@ impl RustLaserApp {
         let mut style = (*cc.egui_ctx.style()).clone();
         style.spacing.item_spacing = egui::vec2(10.0, 8.0);
         cc.egui_ctx.set_style(style);
+        let telemetry_log_path = Self::build_telemetry_log_path();
 
-        Self {
+        let mut app = Self {
             file_path: String::new(),
             gcode_lines: Vec::new(),
             gcode_polyline: Vec::new(),
@@ -86,6 +94,7 @@ impl RustLaserApp {
             show_workspace_axes: true,
             session_config: SessionConfig {
                 gcode_serial_count_mode: GcodeSerialCountMode::RxLogs,
+                no_rx_prompt_exit: true,
             },
             print_active: false,
             loop_active: false,
@@ -98,17 +107,175 @@ impl RustLaserApp {
             rx_buffer_capacity: 127,
             laser_position: None,
             controller_reset_required: false,
-        }
+            is_debug_mode: false,
+            telemetry_enabled: true,
+            telemetry_log_path,
+            rx_fallback_prompt_open: false,
+        };
+        app.append_telemetry_log("STARTUP", "Rust Laser GUI Started!");
+        app
     }
 
-    fn load_file(&mut self) {
-        let path = self.file_path.trim();
-        if path.is_empty() {
-            self.status = "No file selected.".to_string();
+    fn build_telemetry_log_path() -> PathBuf {
+        let timestamp = Command::new("date")
+            .arg("+%F_%H-%M-%S")
+            .output()
+            .ok()
+            .and_then(|output| {
+                if output.status.success() {
+                    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+                } else {
+                    None
+                }
+            })
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "unknown_date_unknown_hour".to_string());
+
+        PathBuf::from("Rust_Laser_GUI_Telemetry")
+            .join(format!("rust_laser_gui_telemetry_{timestamp}.log"))
+    }
+
+    fn telemetry_time_hms() -> String {
+        Command::new("date")
+            .arg("+%H:%M:%S")
+            .output()
+            .ok()
+            .and_then(|output| {
+                if output.status.success() {
+                    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+                } else {
+                    None
+                }
+            })
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "unknown_time".to_string())
+    }
+
+    fn append_telemetry_log(&mut self, label: &str, message: &str) {
+        if !self.telemetry_enabled {
             return;
         }
 
-        match fs::read_to_string(path) {
+        if let Some(parent) = self.telemetry_log_path.parent() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                self.status = format!("Telemetry setup failed: {err}");
+                return;
+            }
+        }
+
+        match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.telemetry_log_path)
+        {
+            Ok(mut file) => {
+                let time_only = Self::telemetry_time_hms();
+                if let Err(err) = writeln!(file, "[{label}][{time_only}]: {message}") {
+                    self.status = format!("Telemetry write failed: {err}");
+                    return;
+                }
+                let variables_json = self.telemetry_variables_json();
+                if let Err(err) = writeln!(file, "[VARIABLES][{time_only}]: {variables_json}") {
+                    self.status = format!("Telemetry write failed: {err}");
+                    return;
+                }
+            }
+            Err(err) => {
+                self.status = format!("Telemetry open failed: {err}");
+                return;
+            }
+        }
+    }
+
+    fn telemetry_variables_json(&self) -> String {
+        format!(
+            concat!(
+                "{{",
+                "\"status\":\"{}\",",
+                "\"serial_connected\":{},",
+                "\"serial_address\":\"{}\",",
+                "\"serial_baud\":{},",
+                "\"print_active\":{},",
+                "\"loop_active\":{},",
+                "\"loop_selecting\":{},",
+                "\"gcode_lines\":{},",
+                "\"gcode_progress_sent\":{},",
+                "\"gcode_progress_total\":{},",
+                "\"rx_buffer_used\":{},",
+                "\"rx_buffer_capacity\":{},",
+                "\"controller_reset_required\":{},",
+                "\"telemetry_enabled\":{},",
+                "\"show_millimeter_grid\":{},",
+                "\"show_workspace_grid\":{},",
+                "\"show_workspace_axes\":{},",
+                "\"gcode_serial_count_mode\":\"{}\",",
+                "\"no_rx_prompt_exit\":{},",
+                "\"rx_fallback_prompt_open\":{},",
+                "\"jog_step_index\":{},",
+                "\"jog_feed\":{},",
+                "\"canvas_center\":[{},{}],",
+                "\"canvas_zoom\":{},",
+                "\"laser_position\":{},",
+                "\"file_path\":\"{}\"",
+                "}}"
+            ),
+            Self::json_escape(&self.status),
+            self.serial_connected,
+            Self::json_escape(&self.serial_address),
+            self.serial_baud,
+            self.print_active,
+            self.loop_active,
+            self.loop_selecting,
+            self.gcode_lines.len(),
+            self.gcode_progress_sent,
+            self.gcode_progress_total,
+            self.rx_buffer_used,
+            self.rx_buffer_capacity,
+            self.controller_reset_required,
+            self.telemetry_enabled,
+            self.show_millimeter_grid,
+            self.show_workspace_grid,
+            self.show_workspace_axes,
+            self.session_config.gcode_serial_count_mode.label(),
+            self.session_config.no_rx_prompt_exit,
+            self.rx_fallback_prompt_open,
+            self.jog_step_index,
+            self.jog_feed,
+            self.canvas_center[0],
+            self.canvas_center[1],
+            self.canvas_zoom,
+            Self::telemetry_optional_position_json(self.laser_position),
+            Self::json_escape(&self.file_path),
+        )
+    }
+
+    fn telemetry_optional_position_json(position: Option<[f32; 2]>) -> String {
+        match position {
+            Some([x, y]) => format!("[{x},{y}]"),
+            None => "null".to_string(),
+        }
+    }
+
+    fn json_escape(value: &str) -> String {
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\t', "\\t")
+    }
+
+    fn load_file(&mut self) {
+        let path = self.file_path.trim().to_string();
+        if path.is_empty() {
+            self.status = "No file selected.".to_string();
+            self.append_telemetry_log("FILE", "Load requested with empty file path");
+            return;
+        }
+
+        self.append_telemetry_log("FILE", &format!("Loading file: {path}"));
+
+        match fs::read_to_string(&path) {
             Ok(content) => {
                 self.gcode_lines = content.lines().map(|line| line.to_string()).collect();
                 self.gcode_polyline = gcode_to_polyline(&self.gcode_lines);
@@ -117,11 +284,20 @@ impl RustLaserApp {
                     self.gcode_lines.len(),
                     self.gcode_polyline.len()
                 );
+                self.append_telemetry_log(
+                    "FILE",
+                    &format!(
+                        "Loaded file successfully: {} line(s), {} plotted point(s)",
+                        self.gcode_lines.len(),
+                        self.gcode_polyline.len()
+                    ),
+                );
             }
             Err(err) => {
                 self.gcode_lines.clear();
                 self.gcode_polyline.clear();
                 self.status = format!("Failed to load file: {err}");
+                self.append_telemetry_log("ERROR", &format!("File load failed: {err}"));
             }
         }
     }
@@ -141,23 +317,44 @@ impl RustLaserApp {
             step,
             feed: self.jog_feed,
         };
+        self.append_telemetry_log(
+            "ACTION",
+            &format!(
+                "Jog move requested: dx={dx:.3}, dy={dy:.3}, step={step:.3}, feed={:.0}",
+                self.jog_feed
+            ),
+        );
         if let Err(err) = self.serial_worker.send(cmd) {
             self.serial_log.push(format!("Jog failed: {err}"));
+            self.append_telemetry_log("ERROR", &format!("Jog command send failed: {err}"));
         }
     }
 
     fn jog_stop(&mut self) {
         self.controller_reset_required = true;
+        self.append_telemetry_log(
+            "ACTION",
+            &format!("Stop requested while print_active={}", self.is_printing()),
+        );
         if self.is_printing() {
             self.serial_worker.request_stop();
         } else if let Err(err) = self.serial_worker.send(SerialCommand::JogStop) {
             self.serial_log.push(format!("Stop failed: {err}"));
+            self.append_telemetry_log("ERROR", &format!("Jog stop send failed: {err}"));
         }
     }
 
     fn send_loaded_gcode(&mut self) {
         self.controller_reset_required = false;
         self.print_active = true;
+        self.append_telemetry_log(
+            "ACTION",
+            &format!(
+                "Send loaded G-code requested: {} line(s), mode={}",
+                self.gcode_lines.len(),
+                self.session_config.gcode_serial_count_mode.label()
+            ),
+        );
         self.serial_log.push(format!(
             "[Printing G-Code] gcode serial count:{}",
             self.session_config.gcode_serial_count_mode.label()
@@ -166,6 +363,7 @@ impl RustLaserApp {
         self.gcode_progress_total = self.gcode_lines.len();
         self.rx_buffer_used = 0;
         self.laser_position = None;
+        self.rx_fallback_prompt_open = false;
         if let Err(err) = self
             .serial_worker
             .send(SerialCommand::SendLoadedGcode {
@@ -174,18 +372,22 @@ impl RustLaserApp {
             })
         {
             self.serial_log.push(format!("Send failed: {err}"));
+            self.append_telemetry_log("ERROR", &format!("Send loaded G-code failed: {err}"));
         }
     }
 
     fn reset_to_origin(&mut self) {
+        self.append_telemetry_log("ACTION", "Reset to origin requested");
         if let Err(err) = self.serial_worker.send(SerialCommand::ResetToOrigin) {
             self.serial_log.push(format!("Reset failed: {err}"));
+            self.append_telemetry_log("ERROR", &format!("Reset to origin failed: {err}"));
         }
     }
 
     fn reset_workspace_view(&mut self) {
         self.canvas_center = [75.0, 75.0];
         self.canvas_zoom = 1.0;
+        self.append_telemetry_log("GUI", "Workspace view reset");
     }
 
     fn loop_feed(&self) -> f32 {
@@ -198,6 +400,7 @@ impl RustLaserApp {
             self.loop_selection_anchor = None;
             self.loop_rectangle = None;
             self.status = "Loop selection cancelled.".to_string();
+            self.append_telemetry_log("LOOP", "Loop selection cancelled");
             return;
         }
 
@@ -206,6 +409,7 @@ impl RustLaserApp {
             self.loop_rectangle = None;
             self.status = "Loop stop requested. Controller reset will be sent automatically."
                 .to_string();
+            self.append_telemetry_log("LOOP", "Loop stop requested");
             return;
         }
 
@@ -214,12 +418,18 @@ impl RustLaserApp {
         self.loop_rectangle = None;
         self.status =
             "Loop mode armed. Click two diagonal rectangle corners in the workspace.".to_string();
+        self.append_telemetry_log("LOOP", "Loop mode armed");
     }
 
     fn handle_loop_selection_click(&mut self, point: [f32; 2]) {
         if !self.loop_selecting {
             return;
         }
+
+        self.append_telemetry_log(
+            "LOOP",
+            &format!("Loop selection click at X{:.3} Y{:.3}", point[0], point[1]),
+        );
 
         if let Some(anchor) = self.loop_selection_anchor {
             if (anchor[0] - point[0]).abs() <= f32::EPSILON
@@ -228,6 +438,10 @@ impl RustLaserApp {
                 self.status =
                     "Loop rectangle needs non-zero width and height. Pick a different second corner."
                         .to_string();
+                self.append_telemetry_log(
+                    "LOOP",
+                    "Loop selection rejected because width or height was zero",
+                );
                 return;
             }
 
@@ -240,6 +454,17 @@ impl RustLaserApp {
                 "Loop rectangle started at F{:.0}. Press Stop Loop to stop.",
                 self.loop_feed()
             );
+            self.append_telemetry_log(
+                "LOOP",
+                &format!(
+                    "Loop rectangle confirmed: ({:.3}, {:.3}) -> ({:.3}, {:.3}) at feed {:.0}",
+                    rectangle[0][0],
+                    rectangle[0][1],
+                    rectangle[1][0],
+                    rectangle[1][1],
+                    self.loop_feed()
+                ),
+            );
             if let Err(err) = self.serial_worker.send(SerialCommand::LoopRectangle {
                 corners: rectangle,
                 feed: self.loop_feed(),
@@ -247,11 +472,13 @@ impl RustLaserApp {
                 self.loop_active = false;
                 self.loop_rectangle = None;
                 self.serial_log.push(format!("Loop start failed: {err}"));
+                self.append_telemetry_log("ERROR", &format!("Loop start failed: {err}"));
             }
         } else {
             self.loop_selection_anchor = Some(point);
             self.loop_rectangle = Some([point, point]);
             self.status = "Loop mode: pick the opposite corner.".to_string();
+            self.append_telemetry_log("LOOP", "Loop first corner stored");
         }
     }
 
@@ -261,32 +488,71 @@ impl RustLaserApp {
         self.gcode_progress_total = 0;
         self.rx_buffer_used = 0;
         self.laser_position = None;
-        self.status =
+        self.rx_fallback_prompt_open = false;
+        self.status = if self.controller_reset_required {
             "Job stopped. Controller is likely in feed-hold; flush/reset to start a new session."
-                .to_string();
+                .to_string()
+        } else {
+            "Job stopped. Controller session was reset; ready for a new print.".to_string()
+        };
+        self.append_telemetry_log("PRINT", "Print aborted event handled by GUI");
     }
 
     fn flush_controller(&mut self) {
+        self.append_telemetry_log("ACTION", "Flush / Reset requested");
         if let Err(err) = self.serial_worker.send(SerialCommand::FlushController) {
             self.serial_log.push(format!("Flush failed: {err}"));
+            self.append_telemetry_log("ERROR", &format!("Flush / Reset failed: {err}"));
         } else {
             self.status = "Controller session reset. Ready for new commands or G-code.".to_string();
             self.controller_reset_required = false;
+            self.append_telemetry_log("ACTION", "Flush / Reset command sent");
         }
     }
 
     fn continue_program(&mut self) {
+        self.append_telemetry_log("ACTION", "Continue requested");
         if let Err(err) = self.serial_worker.send(SerialCommand::ContinueProgram) {
             self.serial_log.push(format!("Continue failed: {err}"));
+            self.append_telemetry_log("ERROR", &format!("Continue failed: {err}"));
         } else {
             self.print_active = true;
             self.status = "Continue sent. Controller resumed from hold.".to_string();
             self.controller_reset_required = false;
+            self.append_telemetry_log("ACTION", "Continue command sent");
         }
     }
 
     fn is_printing(&self) -> bool {
         self.print_active
+    }
+
+    fn show_rx_fallback_prompt(&mut self) {
+        self.rx_fallback_prompt_open = true;
+        self.status = format!(
+            "Controller does not report RX buffer fill. Choose Yes to keep tracking until Idle or No to stop the print."
+        );
+        self.append_telemetry_log(
+            "PRINT",
+            "RX fallback continue prompt shown",
+        );
+    }
+
+    fn confirm_rx_fallback_continue(&mut self) {
+        self.serial_worker.confirm_fallback_continue();
+        self.rx_fallback_prompt_open = false;
+        self.status =
+            "Fallback continue confirmed. Waiting for the controller to report Idle.".to_string();
+        self.append_telemetry_log("PRINT", "RX fallback continue confirmed by user");
+    }
+
+    fn reject_rx_fallback_continue(&mut self) {
+        self.rx_fallback_prompt_open = false;
+        self.append_telemetry_log("PRINT", "RX fallback continue rejected by user");
+        self.status = "Stopping print and resetting controller session for a clean next start."
+            .to_string();
+        self.controller_reset_required = false;
+        self.serial_worker.request_stop_with_reset();
     }
 }
 
@@ -294,31 +560,52 @@ impl eframe::App for RustLaserApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         while let Some(event) = self.serial_worker.try_recv() {
             match event {
-                SerialEvent::Log(line) => self.serial_log.push(line),
+                SerialEvent::Log(line) => {
+                    self.append_telemetry_log("WORKER", &format!("Log event: {line}"));
+                    self.serial_log.push(line);
+                }
                 SerialEvent::Connected(state) => {
                     self.serial_connected = state;
                     if !state {
                         self.rx_buffer_used = 0;
                     }
+                    self.append_telemetry_log("SERIAL", &format!("Connected event: {state}"));
                 }
                 SerialEvent::PrintStarted => {
                     self.print_active = true;
                     self.rx_buffer_used = 0;
+                    self.status = "Print in progress. Streaming G-code to the controller."
+                        .to_string();
+                    self.append_telemetry_log("PRINT", "Print started event");
                 }
                 SerialEvent::PrintFinished => {
                     self.print_active = false;
                     self.rx_buffer_used = 0;
+                    self.rx_fallback_prompt_open = false;
+                    self.append_telemetry_log("PRINT", "Print finished event");
+                }
+                SerialEvent::RxFallbackContinuePrompt => {
+                    self.show_rx_fallback_prompt();
                 }
                 SerialEvent::GcodeProgress { sent, total } => {
                     self.gcode_progress_sent = sent;
                     self.gcode_progress_total = total;
+                    self.append_telemetry_log(
+                        "PROGRESS",
+                        &format!("G-code progress updated: {sent}/{total}"),
+                    );
                 }
                 SerialEvent::RxBufferFill { used, capacity } => {
                     self.rx_buffer_used = used;
                     self.rx_buffer_capacity = capacity;
+                    self.append_telemetry_log(
+                        "PROGRESS",
+                        &format!("RX buffer fill updated: {used}/{capacity}"),
+                    );
                 }
                 SerialEvent::LoopStarted => {
                     self.loop_active = true;
+                    self.append_telemetry_log("LOOP", "Loop started event");
                 }
                 SerialEvent::LoopStopped => {
                     self.loop_active = false;
@@ -328,10 +615,15 @@ impl eframe::App for RustLaserApp {
                     if !self.print_active {
                         self.status = "Loop rectangle stopped.".to_string();
                     }
+                    self.append_telemetry_log("LOOP", "Loop stopped event");
                 }
                 SerialEvent::PrintAborted => self.handle_print_aborted(),
                 SerialEvent::LaserPosition { position } => {
                     self.laser_position = Some(position);
+                    self.append_telemetry_log(
+                        "POSITION",
+                        &format!("Laser position updated: X{:.3} Y{:.3}", position[0], position[1]),
+                    );
                 }
             }
         }
@@ -339,37 +631,232 @@ impl eframe::App for RustLaserApp {
         if self.is_printing() || self.loop_active {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
-
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("Settings", |ui| {
-                    ui.checkbox(&mut self.show_millimeter_grid, "Millimeter grid");
-                    ui.checkbox(&mut self.show_workspace_grid, "Show workspace grid");
-                    ui.checkbox(&mut self.show_workspace_axes, "Show workspace axes");
+                    if ui
+                        .checkbox(&mut self.show_millimeter_grid, "Millimeter grid")
+                        .changed()
+                    {
+                        self.append_telemetry_log(
+                            "SETTINGS",
+                            &format!("Millimeter grid set to {}", self.show_millimeter_grid),
+                        );
+                    }
+                    if ui
+                        .checkbox(&mut self.show_workspace_grid, "Show workspace grid")
+                        .changed()
+                    {
+                        self.append_telemetry_log(
+                            "SETTINGS",
+                            &format!("Workspace grid set to {}", self.show_workspace_grid),
+                        );
+                    }
+                    if ui
+                        .checkbox(&mut self.show_workspace_axes, "Show workspace axes")
+                        .changed()
+                    {
+                        self.append_telemetry_log(
+                            "SETTINGS",
+                            &format!("Workspace axes set to {}", self.show_workspace_axes),
+                        );
+                    }
+                    if ui
+                        .checkbox(
+                            &mut self.session_config.no_rx_prompt_exit,
+                            "No RX Prompt Exit",
+                        )
+                        .changed()
+                    {
+                        self.append_telemetry_log(
+                            "SETTINGS",
+                            &format!(
+                                "No RX Prompt Exit set to {}",
+                                self.session_config.no_rx_prompt_exit
+                            ),
+                        );
+                    }
+                    if ui.checkbox(&mut self.is_debug_mode, "Debug Mode").changed() {
+                        self.append_telemetry_log(
+                            "SETTINGS",
+                            &format!("Debug Mode set to {}", self.is_debug_mode),
+                        );
+                    }
                     ui.menu_button("gcode serial count", |ui| {
-                        ui.selectable_value(
+                        if ui
+                            .selectable_value(
                             &mut self.session_config.gcode_serial_count_mode,
                             GcodeSerialCountMode::CharCount,
                             "char count",
-                        );
-                        ui.selectable_value(
+                        )
+                        .changed()
+                        {
+                            self.append_telemetry_log("SETTINGS", "G-code serial mode set to char count");
+                        }
+                        if ui
+                            .selectable_value(
                             &mut self.session_config.gcode_serial_count_mode,
                             GcodeSerialCountMode::RxLogs,
                             "RX logs",
-                        );
+                        )
+                        .changed()
+                        {
+                            self.append_telemetry_log("SETTINGS", "G-code serial mode set to RX logs");
+                        }
                     });
                     ui.label(format!(
                         "gcode serial count: {}",
                         self.session_config.gcode_serial_count_mode.label()
                     ));
+                    ui.label(format!(
+                        "No RX Prompt Exit: {}",
+                        self.session_config.no_rx_prompt_exit
+                    ));
+                    ui.label(format!("Debug Mode: {}", self.is_debug_mode));
                     ui.separator();
                     if ui.button("Reset workspace view").clicked() {
                         self.reset_workspace_view();
                         ui.close_menu();
                     }
                 });
+                if self.is_debug_mode {
+                    ui.menu_button("Debug", |ui| {
+                        ui.label("Current status");
+                        ui.separator();
+                        ui.monospace(self.status.as_str());
+                        ui.separator();
+                        ui.menu_button("Serial", |ui| {
+                            ui.monospace(format!("serial_connected: {}", self.serial_connected));
+                            ui.monospace(format!("serial_address: {}", self.serial_address));
+                            ui.monospace(format!("serial_baud: {}", self.serial_baud));
+                            ui.monospace(format!("serial_log_lines: {}", self.serial_log.len()));
+                        });
+                        ui.menu_button("Print & RX", |ui| {
+                            ui.monospace(format!("print_active: {}", self.print_active));
+                            ui.monospace(format!("loop_active: {}", self.loop_active));
+                            ui.monospace(format!("gcode_lines: {}", self.gcode_lines.len()));
+                            ui.monospace(format!("gcode_progress_sent: {}", self.gcode_progress_sent));
+                            ui.monospace(format!(
+                                "gcode_progress_total: {}",
+                                self.gcode_progress_total
+                            ));
+                            ui.monospace(format!("rx_buffer_used: {}", self.rx_buffer_used));
+                            ui.monospace(format!(
+                                "rx_buffer_capacity: {}",
+                                self.rx_buffer_capacity
+                            ));
+                            ui.monospace(format!(
+                                "laser_position_set: {}",
+                                self.laser_position.is_some()
+                            ));
+                            ui.monospace(format!(
+                                "session_mode: {}",
+                                self.session_config.gcode_serial_count_mode.label()
+                            ));
+                        });
+                        ui.menu_button("GUI", |ui| {
+                            ui.monospace(format!("loop_selecting: {}", self.loop_selecting));
+                            ui.monospace(format!(
+                                "loop_selection_anchor_set: {}",
+                                self.loop_selection_anchor.is_some()
+                            ));
+                            ui.monospace(format!(
+                                "loop_rectangle_set: {}",
+                                self.loop_rectangle.is_some()
+                            ));
+                            ui.monospace(format!(
+                                "show_millimeter_grid: {}",
+                                self.show_millimeter_grid
+                            ));
+                            ui.monospace(format!(
+                                "show_workspace_grid: {}",
+                                self.show_workspace_grid
+                            ));
+                            ui.monospace(format!(
+                                "show_workspace_axes: {}",
+                                self.show_workspace_axes
+                            ));
+                            ui.monospace(format!(
+                                "gcode_polyline_points: {}",
+                                self.gcode_polyline.len()
+                            ));
+                        });
+                        ui.menu_button("Other", |ui| {
+                            ui.monospace(format!(
+                                "controller_reset_required: {}",
+                                self.controller_reset_required
+                            ));
+                            ui.monospace(format!("jog_step_index: {}", self.jog_step_index));
+                        });
+                        ui.separator();
+                        let telemetry_changed = ui
+                            .checkbox(
+                                &mut self.telemetry_enabled,
+                                "Rust_Laser_GUI_Telemetry",
+                            )
+                            .changed();
+                        if telemetry_changed {
+                            if self.telemetry_enabled {
+                                self.append_telemetry_log("TELEMETRY", "Telemetry Enabled");
+                            } else {
+                                self.telemetry_enabled = true;
+                                self.append_telemetry_log("TELEMETRY", "Telemetry Disabled");
+                                self.telemetry_enabled = false;
+                            }
+                        }
+                    });
+                }
             });
         });
+
+        if self.rx_fallback_prompt_open {
+            egui::Window::new("RX Status Fallback")
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.set_min_width(420.0);
+                    ui.label(
+                        "The controller is not reporting RX buffer status fields in `RX logs` mode.",
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        "All G-code lines were acknowledged locally. Choose Yes to keep tracking motion until the controller reports Idle.",
+                    );
+                    ui.add_space(4.0);
+                    ui.label("Choose Continue to keep tracking motion until the controller reports Idle.");
+                    ui.add_space(12.0);
+                    ui.horizontal_centered(|ui| {
+                        let button_size = egui::vec2(140.0, 44.0);
+
+                        ui.add_space(85.0);
+                        let continue_clicked = ui
+                            .add_sized(
+                                button_size,
+                                egui::Button::new(egui::RichText::new("Continue").strong()),
+                            )
+                            .clicked();
+                        let stop_clicked = ui
+                            .add_sized(
+                                button_size,
+                                egui::Button::new(
+                                    egui::RichText::new("Stop")
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                )
+                                .fill(egui::Color32::from_rgb(180, 40, 40)),
+                            )
+                            .clicked();
+
+                        if continue_clicked {
+                            self.confirm_rx_fallback_continue();
+                        }
+                        if stop_clicked {
+                            self.reject_rx_fallback_continue();
+                        }
+                    });
+                });
+        }
 
         egui::TopBottomPanel::bottom("console_panel")
             .resizable(true)
@@ -414,15 +901,23 @@ impl eframe::App for RustLaserApp {
                                 );
                             });
                             if ui.button("Send").clicked() {
-                                let msg = self.serial_input.trim();
+                                let msg = self.serial_input.trim().to_string();
                                 if !msg.is_empty() {
+                                    self.append_telemetry_log(
+                                        "SERIAL",
+                                        &format!("Manual serial send requested: {msg}"),
+                                    );
                                     match self
                                         .serial_worker
                                         .send(SerialCommand::SendLine(msg.to_string()))
                                     {
                                         Ok(()) => {}
                                         Err(err) => {
-                                            self.serial_log.push(format!("Send failed: {err}"))
+                                            self.serial_log.push(format!("Send failed: {err}"));
+                                            self.append_telemetry_log(
+                                                "ERROR",
+                                                &format!("Manual serial send failed: {err}"),
+                                            );
                                         }
                                     }
                                     self.serial_input.clear();
@@ -438,15 +933,31 @@ impl eframe::App for RustLaserApp {
                     columns[1].label(format!("Baud: {}", self.serial_baud));
                     if columns[1].button("Connect").clicked() {
                         if self.serial_connected {
+                            self.append_telemetry_log("SERIAL", "Disconnect requested");
                             if let Err(err) = self.serial_worker.send(SerialCommand::Disconnect) {
                                 self.serial_log.push(format!("Disconnect failed: {err}"));
+                                self.append_telemetry_log(
+                                    "ERROR",
+                                    &format!("Disconnect request failed: {err}"),
+                                );
                             }
                         } else {
+                            self.append_telemetry_log(
+                                "SERIAL",
+                                &format!(
+                                    "Connect requested: address={}, baud={}",
+                                    self.serial_address, self.serial_baud
+                                ),
+                            );
                             if let Err(err) = self.serial_worker.send(SerialCommand::Connect {
                                 address: self.serial_address.clone(),
                                 baud: self.serial_baud,
                             }) {
                                 self.serial_log.push(format!("Connect failed: {err}"));
+                                self.append_telemetry_log(
+                                    "ERROR",
+                                    &format!("Connect request failed: {err}"),
+                                );
                             }
                         }
                     }
@@ -528,11 +1039,19 @@ impl eframe::App for RustLaserApp {
                 ui.scope(|ui| {
                     ui.add_space(20.0);
                     ui.spacing_mut().slider_width = 300.0;
-                    ui.add(
+                    if ui
+                        .add(
                         egui::Slider::new(&mut self.jog_step_index, 0..=3)
                             .step_by(1.0)
                             .show_value(false),
-                    );
+                    )
+                    .changed()
+                    {
+                        self.append_telemetry_log(
+                            "GUI",
+                            &format!("Jog step index changed to {}", self.jog_step_index),
+                        );
+                    }
                 });
                 ui.horizontal(|ui| {
                     ui.label("0.01");
@@ -543,11 +1062,19 @@ impl eframe::App for RustLaserApp {
                     ui.add_space(64.0);
                     ui.label("10.0");
                 });
-                ui.add(
+                if ui
+                    .add(
                     egui::Slider::new(&mut self.jog_feed, 50.0..=3000.0)
                         .text("Feed (mm/min)")
                         .step_by(10.0),
-                );
+                )
+                .changed()
+                {
+                    self.append_telemetry_log(
+                        "GUI",
+                        &format!("Jog feed changed to {:.0}", self.jog_feed),
+                    );
+                }
                 ui.add_space(2.0);
 
                 let button_size = egui::vec2(56.0, 36.0);
@@ -717,6 +1244,7 @@ impl eframe::App for RustLaserApp {
                                         };
                                         if clicked {
                                             if button_id == 1 {
+                                                self.append_telemetry_log("ACTION", "Home requested");
                                                 if let Err(err) =
                                                     self.serial_worker.send(SerialCommand::Home {
                                                         feed: self.jog_feed,
@@ -724,6 +1252,10 @@ impl eframe::App for RustLaserApp {
                                                 {
                                                     self.serial_log
                                                         .push(format!("Home failed: {err}"));
+                                                    self.append_telemetry_log(
+                                                        "ERROR",
+                                                        &format!("Home command failed: {err}"),
+                                                    );
                                                 }
                                             } else if button_id == 2 {
                                                 if self.controller_reset_required {
@@ -736,6 +1268,10 @@ impl eframe::App for RustLaserApp {
                                             } else if button_id == 4 {
                                                 self.toggle_loop_mode();
                                             } else {
+                                                self.append_telemetry_log(
+                                                    "ACTION",
+                                                    &format!("Placeholder matrix button {button_id} pressed"),
+                                                );
                                                 self.serial_log.push(format!(
                                                     "Matrix button ({row},{col}) pressed"
                                                 ));
@@ -767,15 +1303,21 @@ impl eframe::App for RustLaserApp {
                         ui.text_edit_singleline(&mut self.file_path);
                     });
                     if ui.button("Open").clicked() {
+                        self.append_telemetry_log("FILE", "Open file dialog requested");
                         if let Some(path) = FileDialog::new()
                             .add_filter("G-code", &["gcode", "nc"])
                             .pick_file()
                         {
                             self.file_path = path.display().to_string();
+                            self.append_telemetry_log(
+                                "FILE",
+                                &format!("File selected from dialog: {}", self.file_path),
+                            );
                             self.load_file();
                         }
                     }
                     if ui.button("Load").clicked() {
+                        self.append_telemetry_log("FILE", "Load button pressed");
                         self.load_file();
                     }
                 });
